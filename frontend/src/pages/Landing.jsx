@@ -8,16 +8,31 @@ import LaggingCursor from "@/components/Cursor";
 import LoadingScreen from "@/components/LoadingScreen";
 import HeroCarousel from "@/components/HeroCarousel";
 
+// ── Role definitions ─────────────────────────────────────────────────────────
+const LOGIN_ROLES = [
+  { id: "elder",     label: "Elder",       desc: "60+ · Reconnect with community",    color: "#F2A68A", icon: "🌸" },
+  { id: "youth",     label: "Youth",       desc: "18–30 · Build real connections",    color: "#C8F04B", icon: "⚡" },
+  { id: "community", label: "Organiser",   desc: "Rally your neighbourhood",          color: "#8BBF7A", icon: "🌿" },
+  { id: "guardian",  label: "Guardian",    desc: "Monitor & care for loved ones",     color: "#E8854A", icon: "🛡" },
+];
+
 // ── Login Modal ──────────────────────────────────────────────────────────────
 function LoginModal({ onClose, onOpenRegister }) {
   const { login, sendOtp, forgotPassword } = useAuth();
-  const [mode, setMode] = useState("login"); // "login" | "forgot" | "forgot-sent" | "unverified"
+  const [step, setStep] = useState("role"); // "role" | "login" | "forgot" | "forgot-sent" | "unverified"
+  const [roleChoice, setRoleChoice] = useState(null);
   const [creds, setCreds] = useState({ email: "", password: "" });
   const [forgotEmail, setForgotEmail] = useState("");
   const [unverifiedEmail, setUnverifiedEmail] = useState("");
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
+
+  // Alias so existing code using setMode / mode still works
+  const mode = step;
+  const setMode = setStep;
+
+  const accent = roleChoice?.color || "#C8F04B";
 
   useEffect(() => {
     if (resendCooldown <= 0) return;
@@ -74,32 +89,82 @@ function LoginModal({ onClose, onOpenRegister }) {
     <div className="fixed inset-0 z-50 bg-black/90 backdrop-blur flex items-center justify-center p-4" onClick={onClose}>
       <motion.div initial={{ y: 30, opacity: 0 }} animate={{ y: 0, opacity: 1 }}
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md bg-[#0F0F0F] border border-[#C8F04B]/20 p-8 rounded-sm relative overflow-hidden">
+        className="w-full max-w-md bg-[#0F0F0F] border p-8 rounded-sm relative overflow-hidden transition-colors duration-500"
+        style={{ borderColor: accent + "30" }}>
 
-        {/* Subtle glow */}
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-48 h-px bg-gradient-to-r from-transparent via-[#C8F04B]/40 to-transparent" />
+        {/* Dynamic glow matching selected role */}
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-48 h-px bg-gradient-to-r from-transparent to-transparent transition-all duration-500"
+          style={{ backgroundImage: `linear-gradient(to right, transparent, ${accent}60, transparent)` }} />
 
         <AnimatePresence mode="wait">
-          {/* ── Login ── */}
+
+          {/* ── Step 0: Role selector ── */}
+          {mode === "role" && (
+            <motion.div key="role" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}>
+              <h2 className="font-display text-4xl mb-1">SIGN IN</h2>
+              <p className="label-mono text-[#A0A0A0] mb-6 text-sm">Who are you on SOLACE?</p>
+              <div className="grid grid-cols-2 gap-3 mb-6">
+                {LOGIN_ROLES.map(r => (
+                  <button key={r.id} type="button"
+                    onClick={() => { setRoleChoice(r); setMode("login"); }}
+                    className="p-4 border rounded-sm text-left hover:scale-[1.02] transition-all duration-200 group"
+                    style={{ borderColor: roleChoice?.id === r.id ? r.color : "#222",
+                             background: `${r.color}08` }}>
+                    <span className="text-2xl block mb-2">{r.icon}</span>
+                    <p className="font-display text-xl leading-none" style={{ color: r.color }}>{r.label}</p>
+                    <p className="label-mono text-[#666] text-xs mt-1">{r.desc}</p>
+                  </button>
+                ))}
+              </div>
+              <p className="text-center text-[#A0A0A0] text-sm">
+                New here?{" "}
+                <button type="button" onClick={() => { onClose(); onOpenRegister(); }}
+                  className="text-[#C8F04B] hover:underline label-mono">Create account</button>
+              </p>
+            </motion.div>
+          )}
+
+          {/* ── Login form (after role pick) ── */}
           {mode === "login" && (
             <motion.form key="login" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}
               onSubmit={doLogin}>
-              <h2 className="font-display text-4xl mb-2">WELCOME BACK</h2>
-              <p className="label-mono text-[#A0A0A0] mb-6">Sign in to your SOLACE account</p>
+
+              {/* Role badge + back */}
+              <div className="flex items-center gap-2 mb-5">
+                <button type="button" onClick={() => { setMode("role"); setErr(""); }}
+                  className="label-mono text-[#555] hover:text-white transition text-xs">←</button>
+                {roleChoice && (
+                  <span className="label-mono text-xs px-2 py-0.5 rounded-full border"
+                    style={{ color: accent, borderColor: accent + "40", background: accent + "12" }}>
+                    {roleChoice.icon} {roleChoice.label}
+                  </span>
+                )}
+              </div>
+
+              <h2 className="font-display text-4xl mb-1">WELCOME BACK</h2>
+              <p className="label-mono text-[#A0A0A0] mb-6 text-sm">Sign in to your SOLACE account</p>
 
               <input
-                className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 mb-3 outline-none focus:border-[#C8F04B] transition"
+                className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 mb-3 outline-none transition"
+                style={{ "--tw-ring-color": accent }}
+                onFocus={e => e.target.style.borderColor = accent}
+                onBlur={e => e.target.style.borderColor = "#333"}
                 placeholder="Email address" type="email"
                 value={creds.email} onChange={(e) => setCreds({ ...creds, email: e.target.value })}
                 data-testid="login-email" />
               <input
-                className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 mb-2 outline-none focus:border-[#C8F04B] transition"
+                className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 mb-2 outline-none transition"
+                onFocus={e => e.target.style.borderColor = accent}
+                onBlur={e => e.target.style.borderColor = "#333"}
                 placeholder="Password" type="password"
                 value={creds.password} onChange={(e) => setCreds({ ...creds, password: e.target.value })}
                 data-testid="login-password" />
 
               <button type="button" onClick={() => { setForgotEmail(creds.email); setMode("forgot"); setErr(""); }}
-                className="label-mono text-[#A0A0A0] hover:text-[#C8F04B] text-xs mb-4 block transition">
+                className="label-mono text-xs mb-4 block transition"
+                style={{ color: "#A0A0A0" }}
+                onMouseOver={e => e.target.style.color = accent}
+                onMouseOut={e => e.target.style.color = "#A0A0A0"}>
                 Forgot password?
               </button>
 
@@ -109,14 +174,15 @@ function LoginModal({ onClose, onOpenRegister }) {
               )}
 
               <button type="submit" data-testid="login-submit" disabled={loading}
-                className="w-full bg-[#C8F04B] text-black py-3 label-mono hover:bg-white transition disabled:opacity-60 flex items-center justify-center gap-2">
+                className="w-full py-3 label-mono transition disabled:opacity-60 flex items-center justify-center gap-2"
+                style={{ background: accent, color: "#000" }}>
                 {loading ? <><span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" /> Signing in…</> : "SIGN IN →"}
               </button>
 
               <p className="text-center mt-4 text-[#A0A0A0] text-sm">
                 New here?{" "}
                 <button type="button" onClick={() => { onClose(); onOpenRegister(); }}
-                  className="text-[#C8F04B] hover:underline label-mono">Create account</button>
+                  className="hover:underline label-mono" style={{ color: accent }}>Create account</button>
               </p>
             </motion.form>
           )}
