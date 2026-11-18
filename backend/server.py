@@ -1,12 +1,14 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Body
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Body, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from supabase import create_client, Client
 import os, logging, uuid, jwt, bcrypt, random, smtplib, asyncio, secrets, httpx
 from pathlib import Path
 from pydantic import BaseModel, EmailStr, Field
-from typing import List, Optional, Literal
+from typing import Annotated, List, Optional, Literal
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -26,6 +28,25 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Strip surrounding quotes that some editors add to .env values
 JWT_SECRET = os.environ['JWT_SECRET'].strip('"\'')
 JWT_ALG = "HS256"
+JWT_LIFETIME = timedelta(days=7)
+MIN_JWT_SECRET_LENGTH = 32
+
+
+def check_jwt_secret(secret: str):
+    """Refuse to start with a short, guessable signing secret."""
+    if len(secret) < MIN_JWT_SECRET_LENGTH:
+        raise RuntimeError(
+            f"JWT_SECRET must be at least {MIN_JWT_SECRET_LENGTH} characters. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+
+check_jwt_secret(JWT_SECRET)
+
+# ENV=development prints sign-up codes to the console when email isn't set up.
+# Anything else (the default) never logs codes.
+ENV = os.environ.get('ENV', 'production').strip().lower()
+IS_DEV = ENV in ('development', 'dev', 'local')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip('"\'')
 
 SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
@@ -46,6 +67,24 @@ def _gemini_headers() -> dict:
 
 app = FastAPI(title="SOLACE API")
 api = APIRouter(prefix="/api")
+
+
+def _client_ip(request: Request) -> str:
+    # Behind a hosting proxy (Render, Railway, Fly) set TRUST_PROXY_HEADERS=true so
+    # limits apply per visitor instead of to the proxy's single address.
+    if os.environ.get("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes"):
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+# Rate limits (per IP address). Stops password guessing, code guessing and spam.
+limiter = Limiter(key_func=_client_ip, enabled=os.environ.get("RATE_LIMITS", "on").lower() != "off")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+OTP_MAX_ATTEMPTS = 5
 security = HTTPBearer(auto_error=False)
 
 
@@ -245,7 +284,7 @@ def verify_pw(pw: str, hashed: str) -> bool:
 
 
 def make_token(uid: str) -> str:
-    return jwt.encode({"sub": uid, "exp": datetime.now(timezone.utc) + timedelta(days=30)}, JWT_SECRET, algorithm=JWT_ALG)
+    return jwt.encode({"sub": uid, "exp": datetime.now(timezone.utc) + JWT_LIFETIME}, JWT_SECRET, algorithm=JWT_ALG)
 
 
 async def get_user(creds: HTTPAuthorizationCredentials = Depends(security)):
@@ -285,21 +324,21 @@ def public_user(u):
 
 class RegisterIn(BaseModel):
     email: EmailStr
-    password: str
-    name: str
+    password: str = Field(..., min_length=8, max_length=128)
+    name: str = Field(..., min_length=1, max_length=80)
     role: Literal["elder", "youth", "community", "guardian"] = "community"
-    locality: Optional[str] = "Bengaluru"
+    locality: Optional[str] = Field("Bengaluru", max_length=80)
     accept_terms: bool = False  # must be true: agreed to the privacy policy and terms
 
 
 class LoginIn(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., max_length=128)
 
 
 class OtpIn(BaseModel):
     email: EmailStr
-    otp: str
+    otp: str = Field(..., max_length=10)
 
 
 class ForgotIn(BaseModel):
@@ -307,14 +346,39 @@ class ForgotIn(BaseModel):
 
 
 class ResetIn(BaseModel):
-    token: str
-    new_password: str
+    token: str = Field(..., max_length=200)
+    new_password: str = Field(..., max_length=128)
 
 
 # ===== AUTH ROUTES =====
 
+def _new_otp() -> str:
+    """6-digit code from a cryptographically secure random source."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+async def _store_and_send_otp(email: str, name: str):
+    otp = _new_otp()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    await asyncio.to_thread(_sb_delete, "otps", "email", email)
+    await asyncio.to_thread(_sb_insert, "otps", {"email": email, "otp": otp, "expires": expires, "attempts": 0})
+    # Codes are only ever printed in local development without email set up.
+    if IS_DEV and not EMAIL_CONFIGURED:
+        logging.info(f"[OTP] (development only) code for {email}: {otp}")
+    await send_email(email, "Your SOLACE verification code", _otp_email_html(name, otp))
+
+
+def _otp_message(prefix: str) -> str:
+    if EMAIL_CONFIGURED:
+        return f"{prefix} to your email inbox"
+    if IS_DEV:
+        return f"{prefix} (development: check the server console, email is not set up)"
+    return f"{prefix}. If it doesn't arrive, email may not be set up on the server."
+
+
 @api.post("/auth/register")
-async def register(d: RegisterIn):
+@limiter.limit("5/minute")
+async def register(request: Request, d: RegisterIn):
     """Register account. Email NOT verified yet — OTP is sent to inbox."""
     if not d.accept_terms:
         raise HTTPException(400, "Please agree to the privacy policy and terms to continue")
@@ -339,71 +403,33 @@ async def register(d: RegisterIn):
     try:
         await asyncio.to_thread(_sb_insert, "users", doc)
     except Exception as e:
-        raise HTTPException(500, f"Failed to create account: {e}")
+        logging.error(f"[AUTH] create account failed: {e}")
+        raise HTTPException(500, "Could not create your account. Please try again.")
 
-    # Generate & store OTP
-    otp = str(random.randint(100000, 999999))
-    expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    await asyncio.to_thread(_sb_delete, "otps", "email", d.email)
-    await asyncio.to_thread(_sb_insert, "otps", {"email": d.email, "otp": otp, "expires": expires})
-
-    # Always print OTP so developers can verify without email setup
-    logging.info(f"[OTP] ===========================================")
-    logging.info(f"[OTP] Verification code for {d.email}: {otp}")
-    logging.info(f"[OTP] Expires in 10 minutes")
-    logging.info(f"[OTP] ===========================================")
-
-    email_status = "sent"
-    if not EMAIL_CONFIGURED:
-        email_status = "logged_to_console"
-
-    # Send OTP email (non-blocking — won't fail registration if SMTP is down)
-    await send_email(
-        d.email,
-        "Your SOLACE verification code",
-        _otp_email_html(d.name, otp)
-    )
-
+    await _store_and_send_otp(d.email, d.name)
     return {
         "sent": True,
         "email": d.email,
-        "message": "OTP sent to your email inbox" if EMAIL_CONFIGURED else "OTP sent (check server console — SMTP not configured)",
-        "email_status": email_status,
+        "message": _otp_message("Code sent"),
+        "email_status": "sent" if EMAIL_CONFIGURED else "not_configured",
     }
 
 
 @api.post("/auth/send-otp")
-async def send_otp(email: EmailStr = Body(..., embed=True)):
+@limiter.limit("3/minute")
+async def send_otp(request: Request, email: EmailStr = Body(..., embed=True)):
     """Resend OTP for unverified accounts."""
     u = await asyncio.to_thread(_sb_one, "users", "email", email)
-    if not u:
-        raise HTTPException(404, "No account found with this email")
-    if u.get("email_verified"):
-        raise HTTPException(400, "Email already verified — please log in")
-
-    otp = str(random.randint(100000, 999999))
-    expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    await asyncio.to_thread(_sb_delete, "otps", "email", email)
-    await asyncio.to_thread(_sb_insert, "otps", {"email": email, "otp": otp, "expires": expires})
-
-    logging.info(f"[OTP] ===========================================")
-    logging.info(f"[OTP] Resent code for {email}: {otp}")
-    logging.info(f"[OTP] Expires in 10 minutes")
-    logging.info(f"[OTP] ===========================================")
-
-    await send_email(
-        email,
-        "Your SOLACE verification code",
-        _otp_email_html(u["name"], otp)
-    )
-    return {
-        "sent": True,
-        "message": "OTP resent" if EMAIL_CONFIGURED else "OTP resent (check server console — SMTP not configured)"
-    }
+    # Same answer whether or not the account exists, so this can't be used
+    # to find out who has an account.
+    if u and not u.get("email_verified"):
+        await _store_and_send_otp(email, u["name"])
+    return {"sent": True, "message": _otp_message("If this email is waiting for verification, a new code was sent")}
 
 
 @api.post("/auth/verify-otp")
-async def verify_otp(d: OtpIn):
+@limiter.limit("10/minute")
+async def verify_otp(request: Request, d: OtpIn):
     """Verify the OTP. On success, marks email as verified and returns JWT."""
     record = await asyncio.to_thread(_sb_one, "otps", "email", d.email)
     if not record:
@@ -424,8 +450,15 @@ async def verify_otp(d: OtpIn):
         await asyncio.to_thread(_sb_delete, "otps", "email", d.email)
         raise HTTPException(400, "OTP has expired — please request a new one")
 
-    if record["otp"] != d.otp.strip():
-        raise HTTPException(400, "Incorrect OTP — please try again")
+    if not secrets.compare_digest(str(record["otp"]), d.otp.strip()):
+        attempts = (record.get("attempts") or 0) + 1
+        if attempts >= OTP_MAX_ATTEMPTS:
+            # Too many wrong guesses: throw the code away.
+            await asyncio.to_thread(_sb_delete, "otps", "email", d.email)
+            raise HTTPException(400, "Too many incorrect attempts — please request a new code")
+        await asyncio.to_thread(_sb_update, "otps", "email", d.email, {"attempts": attempts})
+        left = OTP_MAX_ATTEMPTS - attempts
+        raise HTTPException(400, f"Incorrect code — {left} attempt{'s' if left != 1 else ''} left")
 
     # Mark email as verified & clean up OTP
     await asyncio.to_thread(_sb_update, "users", "email", d.email, {"email_verified": True})
@@ -439,7 +472,8 @@ async def verify_otp(d: OtpIn):
 
 
 @api.post("/auth/login")
-async def login(d: LoginIn):
+@limiter.limit("10/minute")
+async def login(request: Request, d: LoginIn):
     u = await asyncio.to_thread(_sb_one, "users", "email", d.email)
     if not u:
         raise HTTPException(401, "Invalid email or password")
@@ -457,7 +491,8 @@ async def me(u=Depends(get_user)):
 
 
 @api.post("/auth/forgot-password")
-async def forgot_password(d: ForgotIn):
+@limiter.limit("3/minute")
+async def forgot_password(request: Request, d: ForgotIn):
     """Send a password-reset link to the user's inbox."""
     u = await asyncio.to_thread(_sb_one, "users", "email", d.email)
     # Always return success to avoid email enumeration
@@ -475,11 +510,12 @@ async def forgot_password(d: ForgotIn):
         "Reset your SOLACE password",
         _reset_email_html(u["name"], reset_url)
     )
-    return {"sent": True, "message": "Reset link sent to your inbox"}
+    return {"sent": True, "message": "If an account exists, a reset link has been sent"}
 
 
 @api.post("/auth/reset-password")
-async def reset_password(d: ResetIn):
+@limiter.limit("10/minute")
+async def reset_password(request: Request, d: ResetIn):
     """Validate reset token and update password."""
     record = await asyncio.to_thread(_sb_one, "password_resets", "token", d.token)
     if not record:
@@ -490,8 +526,8 @@ async def reset_password(d: ResetIn):
         await asyncio.to_thread(_sb_delete, "password_resets", "token", d.token)
         raise HTTPException(400, "Reset link has expired — please request a new one")
 
-    if len(d.new_password) < 6:
-        raise HTTPException(400, "Password must be at least 6 characters")
+    if len(d.new_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
 
     await asyncio.to_thread(_sb_update, "users", "email", record["email"], {"password": hash_pw(d.new_password)})
     await asyncio.to_thread(_sb_delete, "password_resets", "token", d.token)
@@ -500,8 +536,8 @@ async def reset_password(d: ResetIn):
 
 # ===== ONBOARDING =====
 class OnboardingIn(BaseModel):
-    goals: List[str] = []
-    guardian_email: Optional[str] = None
+    goals: List[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=20)
+    guardian_email: Optional[str] = Field(None, max_length=254)
 
 
 @api.post("/onboarding/complete")
@@ -770,15 +806,15 @@ PERSONAS = {
 
 
 class HistoryItem(BaseModel):
-    role: str   # 'user' | 'model'
-    text: str
+    role: str = Field(..., max_length=10)   # 'user' | 'model'
+    text: str = Field(..., max_length=2000)
 
 
 class ChatIn(BaseModel):
-    message: str
-    mood: str = "playful"           # UI mood override
-    detected_mood: str = "neutral"  # client-side regex detection
-    history: List[HistoryItem] = []
+    message: str = Field(..., min_length=1, max_length=2000)
+    mood: str = Field("playful", max_length=20)           # UI mood override
+    detected_mood: str = Field("neutral", max_length=20)  # client-side regex detection
+    history: List[HistoryItem] = Field(default_factory=list, max_length=20)
 
 
 def _fallback_reply(detected_mood: str) -> str:
@@ -829,7 +865,8 @@ async def _call_gemini_chat(persona: str, history: List[HistoryItem], user_messa
 
 
 @api.post("/mitra/chat")
-async def mitra_chat(d: ChatIn, u=Depends(get_user)):
+@limiter.limit("20/minute")
+async def mitra_chat(request: Request, d: ChatIn, u=Depends(get_user)):
     # Safety first: check the message BEFORE anything is sent to Gemini.
     risk = detect_crisis(d.message)
 
@@ -1022,18 +1059,20 @@ async def community_intelligence(u=Depends(get_user)):
 
 
 class OrgEventIn(BaseModel):
-    title: str
-    event_type: str = "general"   # bingo | trivia | skill_swap | cricket | prayer | general
-    date_str: str                  # e.g. "Sat 26 Jul · 4 PM"
-    venue: str
-    price: str = "Free"
-    audience: str = "all"          # all | elder | youth
-    description: Optional[str] = None
+    title: str = Field(..., min_length=1, max_length=120)
+    event_type: str = Field("general", max_length=30)   # bingo | trivia | skill_swap | cricket | prayer | general
+    date_str: str = Field(..., max_length=60)            # e.g. "Sat 26 Jul · 4 PM"
+    venue: str = Field(..., max_length=120)
+    price: str = Field("Free", max_length=30)
+    audience: str = Field("all", max_length=20)          # all | elder | youth
+    description: Optional[str] = Field(None, max_length=1000)
 
 
 @api.post("/organiser/events")
 async def organiser_create_event(d: OrgEventIn, u=Depends(get_user)):
     """Create a community event — appears in feed AND events panel."""
+    if u.get("role") != "community":
+        raise HTTPException(403, "Only community organisers can create events")
     event_id = str(uuid.uuid4())
     category_img = {
         "bingo": "https://images.unsplash.com/photo-1606326608606-aa0b62935f2b?w=600&q=70",
@@ -1152,12 +1191,13 @@ REPORTS_TO_HIDE = 3  # a post is hidden for review after this many reports
 
 class PostIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=POST_MAX_LENGTH)
-    category: Optional[str] = "general"
-    image: Optional[str] = None
+    category: Optional[Literal["general", "recipe", "event", "hobby", "fitness"]] = "general"
+    image: Optional[str] = Field(None, max_length=500, pattern=r"^https://")
 
 
 @api.post("/feed")
-async def feed_post(d: PostIn, u=Depends(get_user)):
+@limiter.limit("10/minute")
+async def feed_post(request: Request, d: PostIn, u=Depends(get_user)):
     risk = detect_crisis(d.text)
     # Crisis posts are held back from the public feed; the poster sees the helpline card.
     status = "held" if risk == "crisis" else "visible"
@@ -1211,10 +1251,33 @@ async def feed_report(post_id: str, d: ReportIn = Body(default_factory=ReportIn)
     return {"ok": True, "message": "Thanks for letting us know. We'll take a look."}
 
 
+async def _already(table: str, **match) -> bool:
+    """True if a row matching all the given fields exists."""
+    def q():
+        query = supabase.table(table).select("id")
+        for k, v in match.items():
+            query = query.eq(k, v)
+        return query.limit(1).execute()
+    r = await asyncio.to_thread(q)
+    return bool(r.data)
+
+
 @api.post("/feed/{post_id}/heart")
 async def feed_heart(post_id: str, u=Depends(get_user)):
+    """One heart per person per post (stops points farming)."""
+    post = await asyncio.to_thread(_sb_one, "posts", "id", post_id)
+    if not post:
+        raise HTTPException(404, "Post not found")
+    if await _already("post_hearts", post_id=post_id, user_id=u["id"]):
+        return {"ok": True, "already": True}
+    try:
+        await asyncio.to_thread(_sb_insert, "post_hearts",
+                                {"id": str(uuid.uuid4()), "post_id": post_id, "user_id": u["id"], "ts": now_iso()})
+    except Exception:
+        return {"ok": True, "already": True}  # unique constraint: a parallel click got there first
     await asyncio.to_thread(_sb_inc, "posts", "id", post_id, {"hearts": 1})
-    await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 1})
+    if post.get("user_id") != u["id"]:
+        await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 1})
     return {"ok": True}
 
 
@@ -1788,6 +1851,10 @@ async def events_list():
 
 @api.post("/events/{event_id}/rsvp")
 async def event_rsvp(event_id: str, u=Depends(get_user)):
+    if len(event_id) > 100:
+        raise HTTPException(400, "Invalid event")
+    if await _already("rsvps", event_id=event_id, user_id=u["id"]):
+        return {"ok": True, "already": True, "points_earned": 0}
     await asyncio.to_thread(_sb_insert, "rsvps",
         {"id": str(uuid.uuid4()), "user_id": u["id"], "event_id": event_id, "ts": now_iso()})
     await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 10})
@@ -1828,22 +1895,32 @@ async def riddle_today():
 
 
 class RiddleAnswer(BaseModel):
-    id: int
-    answer: str
+    id: int = Field(..., ge=0)
+    answer: str = Field(..., max_length=100)
 
 
 @api.post("/games/riddle/answer")
 async def riddle_answer(d: RiddleAnswer, u=Depends(get_user)):
-    correct = RIDDLES[d.id % len(RIDDLES)]["a"].lower() in d.answer.lower().strip()
+    """One answer per person per day; points only for a correct first answer."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    riddle = RIDDLES[d.id % len(RIDDLES)]
+    if await _already("riddle_answers", user_id=u["id"], date=today):
+        return {"correct": None, "already_answered": True, "answer": riddle["a"]}
+    correct = riddle["a"].lower() in d.answer.lower().strip()
+    try:
+        await asyncio.to_thread(_sb_insert, "riddle_answers", {
+            "id": str(uuid.uuid4()), "user_id": u["id"], "date": today, "correct": correct, "ts": now_iso()})
+    except Exception:
+        return {"correct": None, "already_answered": True, "answer": riddle["a"]}
     if correct:
         await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 12})
-    return {"correct": correct, "answer": RIDDLES[d.id % len(RIDDLES)]["a"]}
+    return {"correct": correct, "answer": riddle["a"]}
 
 
 # ===== HOBBIES =====
 class HobbyIn(BaseModel):
-    name: str
-    goal_per_week: int = 3
+    name: str = Field(..., min_length=1, max_length=80)
+    goal_per_week: int = Field(3, ge=1, le=14)
 
 
 @api.get("/hobbies")
@@ -1861,6 +1938,9 @@ async def hobby_add(d: HobbyIn, u=Depends(get_user)):
 
 @api.post("/hobbies/{hobby_id}/log")
 async def hobby_log(hobby_id: str, u=Depends(get_user)):
+    hobby = await asyncio.to_thread(_sb_one, "hobbies", "id", hobby_id)
+    if not hobby or hobby.get("user_id") != u["id"]:
+        raise HTTPException(404, "Hobby not found")
     await asyncio.to_thread(_sb_inc, "hobbies", "id", hobby_id, {"done_this_week": 1})
     await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 4})
     return {"ok": True}
@@ -1910,9 +1990,9 @@ async def wellness_complete(session_id: str, u=Depends(get_user)):
 
 # ===== COMMUNITY ORGANISER PANEL =====
 class TaskIn(BaseModel):
-    title: str
+    title: str = Field(..., min_length=1, max_length=200)
     audience: Literal["elder", "youth", "all"] = "all"
-    points: int = 10
+    points: int = Field(10, ge=1, le=50)
 
 
 @api.get("/organiser/tasks")
@@ -1939,9 +2019,19 @@ async def organiser_create_task(d: TaskIn, u=Depends(get_user)):
 
 @api.post("/organiser/tasks/{task_id}/claim")
 async def task_claim(task_id: str, u=Depends(get_user)):
-    await asyncio.to_thread(_sb_inc, "organiser_tasks", "id", task_id, {"claims": 1})
+    """One claim per person per task (stops points farming)."""
     t = await asyncio.to_thread(_sb_one, "organiser_tasks", "id", task_id)
-    pts = t["points"] if t else 10
+    if not t:
+        raise HTTPException(404, "Task not found")
+    if await _already("task_claims", task_id=task_id, user_id=u["id"]):
+        return {"ok": True, "already": True, "points_earned": 0}
+    try:
+        await asyncio.to_thread(_sb_insert, "task_claims",
+                                {"id": str(uuid.uuid4()), "task_id": task_id, "user_id": u["id"], "ts": now_iso()})
+    except Exception:
+        return {"ok": True, "already": True, "points_earned": 0}
+    await asyncio.to_thread(_sb_inc, "organiser_tasks", "id", task_id, {"claims": 1})
+    pts = min(int(t.get("points") or 10), 50)
     await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": pts})
     return {"ok": True, "points_earned": pts}
 
@@ -2017,9 +2107,15 @@ async def delete_my_account(d: DeleteMeIn, u=Depends(get_user)):
 
 
 app.include_router(api)
-app.add_middleware(CORSMiddleware, allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"], allow_headers=["*"])
+# CORS: only the real frontend may call the API from a browser.
+CORS_ORIGINS = [o.strip() for o in os.environ.get('CORS_ORIGINS', FRONTEND_URL).split(',') if o.strip()]
+if "*" in CORS_ORIGINS:
+    logging.warning("[CORS] CORS_ORIGINS='*' lets any website call the API. Set it to your frontend URL.")
+app.add_middleware(CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials="*" not in CORS_ORIGINS,  # never wildcard + credentials
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"])
 
 logging.basicConfig(level=logging.INFO)
 
@@ -2027,28 +2123,14 @@ logging.basicConfig(level=logging.INFO)
 # ===== HEALTH =====
 @app.get("/api/health")
 async def health():
-    """Quick health check — call this to verify the server is up and config is correct."""
-    sb_ok = False
-    sb_detail = ""
+    """Is the server up, and can it reach the database? Reveals nothing else."""
     try:
-        r = await asyncio.to_thread(lambda: supabase.table("users").select("id").limit(1).execute())
-        sb_ok = True
-        sb_detail = f"{len(r.data)} row(s) visible"
+        await asyncio.to_thread(lambda: supabase.table("users").select("id").limit(1).execute())
+        db = "ok"
     except Exception as e:
-        sb_detail = str(e)
-
-    return {
-        "status": "ok",
-        "supabase": {"connected": sb_ok, "detail": sb_detail},
-        "email": {
-            "configured": EMAIL_CONFIGURED,
-            "smtp_host": SMTP_HOST,
-            "smtp_user": SMTP_USER if EMAIL_CONFIGURED else "(not set)",
-            "note": "Set SMTP_USER + SMTP_PASS in .env to enable email delivery" if not EMAIL_CONFIGURED else "Ready",
-        },
-        "jwt": {"algorithm": JWT_ALG, "secret_length": len(JWT_SECRET)},
-        "gemini": {"configured": bool(GEMINI_API_KEY)},
-    }
+        logging.error(f"[HEALTH] database check failed: {e}")
+        db = "error"
+    return {"status": "ok", "database": db}
 
 
 # ===== STARTUP LOG =====
@@ -2056,8 +2138,8 @@ async def health():
 async def startup_log():
     logging.info("=" * 55)
     logging.info("  SOLACE API starting up")
-    logging.info(f"  Supabase: {SUPABASE_URL}")
-    logging.info(f"  Email:    {'CONFIGURED (' + SMTP_USER + ')' if EMAIL_CONFIGURED else 'NOT CONFIGURED (OTPs logged to console)'}")
+    logging.info(f"  Env:      {ENV}")
+    logging.info(f"  Email:    {'configured' if EMAIL_CONFIGURED else 'NOT configured'}")
     logging.info(f"  Gemini:   {'configured' if GEMINI_API_KEY else 'not set'}")
     logging.info("  Health:   GET /api/health")
     logging.info("=" * 55)

@@ -81,7 +81,7 @@ cp .env.example .env                # then fill in the values
 uvicorn server:app --reload --port 8000
 ```
 
-`backend/.env` needs at least `SUPABASE_URL`, `SUPABASE_SECRET_KEY` and `JWT_SECRET`. See `.env.example` for every option and how to get each value. If SMTP is not set up, sign-up codes are printed in the backend console during development.
+`backend/.env` needs at least `SUPABASE_URL`, `SUPABASE_SECRET_KEY` and `JWT_SECRET`. See `.env.example` for every option and how to get each value. If SMTP is not set up and `ENV=development`, sign-up codes are printed in the backend console. In production (the default) codes are never logged.
 
 Check it works: open <http://localhost:8000/api/health>. API docs are at <http://localhost:8000/docs>.
 
