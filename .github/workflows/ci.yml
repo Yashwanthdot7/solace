@@ -1,0 +1,52 @@
+# Runs automatically on every push and pull request.
+# A green tick on a PR means the backend tests pass and the frontend builds.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run tests
+        run: pytest
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: frontend/yarn.lock
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Build
+        run: yarn build
+        env:
+          REACT_APP_BACKEND_URL: http://localhost:8000
