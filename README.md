@@ -2,212 +2,115 @@
 
 # 🌿 SOLACE
 
-**Your personal mental-wellness companion — powered by AI**
+**A wellbeing and community app for Bengaluru, with an AI companion called Mitra**
 
-*A full-stack web application that provides a safe, compassionate space for emotional support, mood tracking, and self-care.*
-
----
-
+[![CI](https://github.com/Yashwanthdot7/solace/actions/workflows/ci.yml/badge.svg)](https://github.com/Yashwanthdot7/solace/actions/workflows/ci.yml)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)](https://react.dev/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-Motor-47A248?style=flat-square&logo=mongodb)](https://motor.readthedocs.io/)
-[![TailwindCSS](https://img.shields.io/badge/TailwindCSS-3.4-38B2AC?style=flat-square&logo=tailwindcss)](https://tailwindcss.com/)
-[![Gemini](https://img.shields.io/badge/Google-Gemini_AI-4285F4?style=flat-square&logo=google)](https://ai.google.dev/)
+[![Supabase](https://img.shields.io/badge/Supabase-Postgres-3FCF8E?style=flat-square&logo=supabase)](https://supabase.com/)
+[![Gemini](https://img.shields.io/badge/Google-Gemini-4285F4?style=flat-square&logo=google)](https://ai.google.dev/)
 
 </div>
 
----
-
-## ✨ Overview
-
-**SOLACE** is a mental-wellness platform designed to help users reflect, track their emotional health, and receive empathetic AI-guided support. Built with a modern React frontend and a FastAPI backend, SOLACE combines intelligent conversation with structured well-being features.
+> **Solace is not a medical service.** Mitra is an AI companion, not a doctor or therapist.
+> In an emergency in India call **112**. For mental-health support call **Tele-MANAS 14416**
+> (free, 24×7).
 
 ---
 
-## 🚀 Features
+## What it does
 
-| Feature | Description |
-|---|---|
-| 🔐 **Authentication** | Secure sign-up / login with JWT + OTP email verification |
-| 🧠 **AI Companion** | Conversational support powered by Google Gemini AI |
-| 📊 **Mood Tracking** | Log and visualise your emotional patterns over time |
-| 📓 **Journaling** | Private, encrypted personal journal entries |
-| 🎯 **Onboarding** | Personalised onboarding flow to tailor the experience |
-| 📧 **Email Notifications** | OTP verification and well-being reminders via SMTP |
-| 🌙 **Dark-first UI** | Sleek, minimal dark interface built with Radix UI + Tailwind |
+Solace helps people stay connected and look after their wellbeing. There are four kinds of member, each with their own dashboard:
 
----
+| Role | Who it is for | Highlights |
+|---|---|---|
+| **Elder** | People 60+ who may feel isolated | Mitra chat, daily joy challenge, journal, games, local events |
+| **Youth** | Young adults, often stressed or new to the city | Mitra chat, feed, events, hobbies, mindfulness |
+| **Community** (organiser) | People who run local groups | Issue tasks, create events, anonymised community health |
+| **Guardian** | Family members who look out for someone | A wellbeing summary of a linked family member |
 
-## 🗂️ Project Structure
+Main features: email sign-up with a one-time code, Mitra (Gemini-powered chat with a built-in fallback when Gemini is down), journal, community feed, events (live from Gemini with a 6-hour cache), games and riddles, hobbies, mindfulness sessions, joy challenges and a wellbeing score.
+
+## Tech stack
+
+- **Frontend:** React 19, React Router 7, Tailwind CSS + shadcn/Radix UI, Framer Motion, built with CRACO. Package manager: **Yarn**.
+- **Backend:** Python FastAPI in a single file, `backend/server.py`.
+- **Database:** [Supabase](https://supabase.com/) (hosted Postgres). Schema lives in `supabase/migrations/`.
+- **AI:** Google Gemini 2.0 Flash over its REST API.
+- **Email:** any SMTP account (Gmail App Password works for development).
+
+## Project layout
 
 ```
 solace/
-├── backend/                  # FastAPI Python backend
-│   ├── server.py             # Main API server (routes, auth, AI, DB)
-│   ├── requirements.txt      # Python dependencies
-│   ├── pytest.ini            # Test configuration
-│   └── .env.example          # Environment variable template
-│
-├── frontend/                 # React 19 frontend
-│   ├── src/
-│   │   ├── components/       # Reusable UI components (Onboarding, etc.)
-│   │   ├── contexts/         # React context providers (AuthContext)
-│   │   ├── pages/            # Page-level components
-│   │   ├── hooks/            # Custom React hooks
-│   │   ├── lib/              # Utility helpers
-│   │   └── constants/        # App-wide constants
-│   ├── public/               # Static assets
-│   ├── package.json          # Node dependencies
-│   └── tailwind.config.js    # Tailwind configuration
-│
-└── tests/                    # Integration / end-to-end tests
+├── backend/
+│   ├── server.py              # the whole API
+│   ├── requirements.txt       # runtime packages
+│   ├── requirements-dev.txt   # test and lint tools
+│   ├── tests/                 # pytest tests (use an in-memory fake database)
+│   └── .env.example
+├── frontend/
+│   ├── src/                   # pages, components, contexts, lib
+│   └── .env.example
+├── supabase/
+│   ├── migrations/            # SQL that creates the tables
+│   └── seed.sql               # demo data for a development project
+├── docs/IMPLEMENTATION_PLAN.md
+└── .github/workflows/ci.yml   # runs tests + build on every PR
 ```
 
----
+## Getting started
 
-## 🛠️ Tech Stack
+You need **Python 3.11+**, **Node.js 18+** with **Yarn 1.22**, a free **Supabase** project, a **Gemini API key** (optional, Mitra falls back to built-in replies without one) and optionally an SMTP account.
 
-### Backend
-- **[FastAPI](https://fastapi.tiangolo.com/)** — High-performance Python web framework
-- **[Motor](https://motor.readthedocs.io/)** — Async MongoDB driver
-- **[PyJWT](https://pyjwt.readthedocs.io/)** + **[bcrypt](https://pypi.org/project/bcrypt/)** — Authentication & password hashing
-- **[Google Gemini AI](https://ai.google.dev/)** — Conversational AI engine
-- **SMTP** — Email delivery for OTP verification
+### 1. Create the database
 
-### Frontend
-- **[React 19](https://react.dev/)** + **[React Router v7](https://reactrouter.com/)** — UI framework & routing
-- **[TailwindCSS 3](https://tailwindcss.com/)** + **[Radix UI](https://www.radix-ui.com/)** — Styling & accessible components
-- **[Framer Motion](https://www.framer.com/motion/)** — Animations
-- **[Recharts](https://recharts.org/)** — Data visualisation
-- **[React Hook Form](https://react-hook-form.com/)** + **[Zod](https://zod.dev/)** — Form handling & validation
-- **[Axios](https://axios-http.com/)** — HTTP client
+1. Create a project at [supabase.com](https://supabase.com/dashboard).
+2. Open **SQL Editor**, paste in each file from `supabase/migrations/` in number order, and press **Run** for each.
+3. (Development only) paste in `supabase/seed.sql` and run it. This adds four demo accounts, one per role, all with the password `demo-password-123`. Never run the seed on a real production project.
+4. Go to **Settings → API** and copy the **Project URL** and the **secret** (service role) key.
 
----
-
-## ⚙️ Getting Started
-
-### Prerequisites
-
-- **Python** ≥ 3.11
-- **Node.js** ≥ 18 & **Yarn** ≥ 1.22
-- A running **MongoDB** instance (local or Atlas)
-- A **Google Gemini API** key
-- An SMTP email account (e.g. Gmail with App Password)
-
----
-
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/<your-username>/solace.git
-cd solace
-```
-
----
-
-### 2. Backend Setup
+### 2. Run the backend
 
 ```bash
 cd backend
-
-# Create & activate a virtual environment
 python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS / Linux
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy the env template and fill in your values
-cp .env.example .env
-```
-
-**`backend/.env` variables:**
-
-```env
-MONGO_URL=mongodb://localhost:27017
-DB_NAME=solace
-JWT_SECRET=your_super_secret_jwt_key
-
-GEMINI_API_KEY=your_gemini_api_key
-
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=your@email.com
-SMTP_PASS=your_app_password
-SMTP_FROM=SOLACE <noreply@solace.in>
-
-FRONTEND_URL=http://localhost:3000
-```
-
-**Start the backend server:**
-
-```bash
+source venv/bin/activate            # Windows: venv\Scripts\activate
+pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env                # then fill in the values
 uvicorn server:app --reload --port 8000
 ```
 
-The API will be available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+`backend/.env` needs at least `SUPABASE_URL`, `SUPABASE_SECRET_KEY` and `JWT_SECRET`. See `.env.example` for every option and how to get each value. If SMTP is not set up, sign-up codes are printed in the backend console during development.
 
----
+Check it works: open <http://localhost:8000/api/health>. API docs are at <http://localhost:8000/docs>.
 
-### 3. Frontend Setup
+### 3. Run the frontend
 
 ```bash
 cd frontend
-
-# Install dependencies
 yarn install
-
-# Copy the env template and fill in your values
-cp .env.example .env
-```
-
-**`frontend/.env` variables:**
-
-```env
-REACT_APP_BACKEND_URL=http://localhost:8000
-```
-
-**Start the development server:**
-
-```bash
+cp .env.example .env                # REACT_APP_BACKEND_URL=http://localhost:8000
 yarn start
 ```
 
-The app will open at `http://localhost:3000`.
+The app opens at <http://localhost:3000>.
 
----
-
-## 🧪 Running Tests
+## Running the tests
 
 ```bash
 cd backend
 pytest
 ```
 
----
+The tests use a fake in-memory database and never call Supabase, Gemini or email, so they need no `.env` and no internet. The same tests and a frontend build run automatically on every pull request (see the **Checks** tab on GitHub).
 
-## 🔒 Security Notes
+## Security notes
 
-> **Never commit your `.env` files.** They are listed in `.gitignore` and contain secrets such as API keys, JWT secrets, and SMTP credentials.
+- Never commit `.env` files. They are in `.gitignore`.
+- The backend uses the Supabase **secret** key, so keep it on the server only. Row Level Security is switched on for every table, so the public anon key cannot read data.
+- If a key has ever been committed or shared, rotate it in the provider's dashboard.
 
-Before pushing, ensure you have created `.env.example` files in both `backend/` and `frontend/` with placeholder values — these **are** safe to commit.
+## Roadmap
 
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Commit your changes: `git commit -m 'feat: add your feature'`
-4. Push to your branch: `git push origin feature/your-feature`
-5. Open a Pull Request
-
----
-
-
-<div align="center">
-  Made with 💚 — <em>because mental health matters</em>
-</div>
+See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for the step-by-step plan to launch.
