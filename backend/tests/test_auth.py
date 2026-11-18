@@ -1,7 +1,8 @@
 """Sign-up, email verification and login."""
 from tests.conftest import make_user
 
-NEW_USER = {"email": "new@example.com", "password": "secret123", "name": "Ravi Kumar", "role": "youth"}
+NEW_USER = {"email": "new@example.com", "password": "secret123", "name": "Ravi Kumar", "role": "youth",
+            "accept_terms": True}
 
 
 def test_register_verify_then_login(client, db):
@@ -82,3 +83,14 @@ def test_password_reset_flow(client, db):
 def test_forgot_password_does_not_reveal_unknown_emails(client):
     r = client.post("/api/auth/forgot-password", json={"email": "nobody@example.com"})
     assert r.status_code == 200
+
+
+def test_register_requires_consent(client, db):
+    r = client.post("/api/auth/register", json={**NEW_USER, "accept_terms": False})
+    assert r.status_code == 400
+    assert "users" not in db.tables or db.tables["users"] == []
+
+
+def test_register_stores_consent_time(client, db):
+    client.post("/api/auth/register", json=NEW_USER)
+    assert db.tables["users"][0]["consented_at"]

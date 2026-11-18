@@ -15,6 +15,7 @@ const NAV_BY_ROLE = {
     { to: "/games", label: "Games" },
     { to: "/events", label: "Events" },
     { to: "/chat", label: "Chat" },
+    { to: "/settings", label: "Settings" },
   ],
   youth: [
     { to: "/dashboard", label: "Home" },
@@ -25,6 +26,7 @@ const NAV_BY_ROLE = {
     { to: "/journal", label: "Journal" },
     { to: "/chat", label: "Chat" },
     { to: "/profile", label: "Profile" },
+    { to: "/settings", label: "Settings" },
   ],
   community: [
     { to: "/dashboard", label: "Command" },
@@ -34,6 +36,7 @@ const NAV_BY_ROLE = {
     { to: "/games",     label: "Games" },
     { to: "/journal",   label: "Journal" },
     { to: "/members",   label: "Members" },
+    { to: "/settings", label: "Settings" },
   ],
   guardian: [
     { to: "/dashboard", label: "Monitor" },
@@ -41,6 +44,7 @@ const NAV_BY_ROLE = {
     { to: "/feed",      label: "Feed" },
     { to: "/events",    label: "Events" },
     { to: "/chat",      label: "Chat" },
+    { to: "/settings", label: "Settings" },
   ],
 };
 

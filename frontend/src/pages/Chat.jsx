@@ -22,14 +22,13 @@ export default function Chat() {
 
       <div className="border border-[#1A1A1A] rounded-sm" data-testid="chat-window">
         <div className="p-5 space-y-4 h-[60vh] overflow-y-auto no-scrollbar">
+          {msgs.length === 0 && (
+            <p className="text-[#888]" data-testid="chat-empty">
+              Neighbourhood group chat is coming soon. Messages you type here are not sent to anyone yet.
+            </p>
+          )}
           {msgs.map((m) => (
             <div key={m.id}>
-              {m.ai_notice && (
-                <div className="mb-2 p-3 border border-[#B8A8E8]/30 bg-[#B8A8E8]/5 rounded-sm" data-testid="chat-inline-ai-notice">
-                  <p className="label-mono text-[#B8A8E8]">⟡ mitra notice</p>
-                  <p className="text-sm mt-1 text-[#B8A8E8]">{m.author} has mentioned feeling low 3 times this week. A warm response from the group could help — guardian quietly notified.</p>
-                </div>
-              )}
               <div className="flex gap-3">
                 <div className="w-10 h-10 rounded-full bg-[#C8F04B]/20 flex items-center justify-center font-display">{m.author?.[0]}</div>
                 <div>

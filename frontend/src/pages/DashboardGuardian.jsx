@@ -93,7 +93,7 @@ export default function DashboardGuardian() {
             </motion.span>
           )}
           <span className="label-mono text-xs text-[#555] italic">
-            · Monitoring is invisible to them — they use Solace freely
+            · They chose to share a summary with you, and can stop at any time
           </span>
         </div>
         <h1 className="font-display text-6xl md:text-8xl leading-none mt-2">
