@@ -120,7 +120,10 @@ export default function Onboarding({ onClose }) {
       setOtp("");
       next();
     } catch (e) {
-      setErr(e.response?.data?.detail || "Registration failed. Please try again.");
+      const detail = e.response?.data?.detail;
+      if (e.response?.status === 429) setErr("Too many attempts. Please wait a minute and try again.");
+      else if (Array.isArray(detail)) setErr("Please check your details: name, a valid email, and a password of at least 8 characters.");
+      else setErr(detail || "Registration failed. Please try again.");
     }
   };
 
@@ -226,7 +229,7 @@ export default function Onboarding({ onClose }) {
                     <input className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 focus:border-[#C8F04B] outline-none transition"
                       placeholder="email@you.com" type="email" value={data.email} onChange={(e) => setData({ ...data, email: e.target.value })} data-testid="onboarding-email" />
                     <input className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 focus:border-[#C8F04B] outline-none transition"
-                      placeholder="Password (min 6 characters)" type="password" value={data.password} onChange={(e) => setData({ ...data, password: e.target.value })} data-testid="onboarding-password" />
+                      placeholder="Password (min 8 characters)" type="password" value={data.password} onChange={(e) => setData({ ...data, password: e.target.value })} data-testid="onboarding-password" />
                     <input className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 focus:border-[#C8F04B] outline-none transition"
                       placeholder="Locality (e.g. Indiranagar)" value={data.locality} onChange={(e) => setData({ ...data, locality: e.target.value })} />
                     <label className="flex items-start gap-3 text-sm text-[#D0D0D0] pt-2" data-testid="onboarding-consent">
@@ -344,7 +347,7 @@ export default function Onboarding({ onClose }) {
             ← Back
           </button>
           {step === 1 ? (
-            <button onClick={submitAccount} disabled={!data.email || !data.password || !data.name || !agreed}
+            <button onClick={submitAccount} disabled={!data.email || data.password.length < 8 || !data.name || !agreed}
               className="bg-[#C8F04B] text-black px-6 py-2 label-mono disabled:opacity-30 hover:bg-white transition">
               Send Code →
             </button>

@@ -103,7 +103,8 @@ function Riddle() {
         className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 outline-none focus:border-[#F2A68A] mb-3" />
       <button onClick={submit} data-testid="riddle-submit" className="w-full py-3 bg-[#F2A68A] text-black label-mono">SUBMIT →</button>
       {res && <p className={`mt-4 label-mono ${res.correct ? "text-[#8BBF7A]" : "text-[#F2A68A]"}`}>
-        {res.correct ? "✓ Correct! +12 pts" : `× Not quite. Answer: ${res.answer}`}
+        {res.already_answered ? `You've answered today's riddle. Answer: ${res.answer}. Come back tomorrow!`
+          : res.correct ? "✓ Correct! +12 pts" : `× Not quite. Answer: ${res.answer}`}
       </p>}
     </div>
   );

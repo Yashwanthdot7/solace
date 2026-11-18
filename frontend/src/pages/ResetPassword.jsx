@@ -18,7 +18,7 @@ export default function ResetPassword() {
   const strength = (() => {
     if (password.length === 0) return 0;
     let s = 0;
-    if (password.length >= 6) s++;
+    if (password.length >= 8) s++;
     if (password.length >= 10) s++;
     if (/[A-Z]/.test(password)) s++;
     if (/[0-9]/.test(password)) s++;
@@ -32,7 +32,7 @@ export default function ResetPassword() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setErr("");
-    if (password.length < 6) { setErr("Password must be at least 6 characters"); return; }
+    if (password.length < 8) { setErr("Password must be at least 8 characters"); return; }
     if (password !== confirm) { setErr("Passwords do not match"); return; }
     setStep("loading");
     try {

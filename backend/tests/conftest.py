@@ -34,8 +34,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def db():
-    """A fresh, empty in-memory database for every test."""
+    """A fresh, empty in-memory database (and fresh rate limits) for every test."""
     FAKE_DB.reset()
+    server.limiter.reset()
     yield FAKE_DB
     FAKE_DB.reset()
 

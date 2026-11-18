@@ -49,8 +49,11 @@ export default function Feed() {
   };
 
   const heart = async (id) => {
-    await api.post(`/feed/${id}/heart`);
-    setPosts((p) => p.map(x => x.id === id ? { ...x, hearts: (x.hearts||0)+1 } : x));
+    try {
+      const r = await api.post(`/feed/${id}/heart`);
+      if (r.data?.already) return;
+      setPosts((p) => p.map(x => x.id === id ? { ...x, hearts: (x.hearts||0)+1 } : x));
+    } catch { /* demo posts can't be hearted */ }
   };
 
   return (
