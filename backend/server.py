@@ -5,11 +5,16 @@ from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import os, logging, uuid, jwt, bcrypt, random, smtplib, asyncio, secrets, httpx
 from pathlib import Path
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional, Literal
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
+from safety import (
+    detect_crisis, helpline_line, HELPLINES, CRISIS_REPLY, SAFETY_RULES,
+    CONCERN_PERSONA, GEMINI_SAFETY_SETTINGS,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -788,6 +793,7 @@ async def _call_gemini_chat(persona: str, history: List[HistoryItem], user_messa
                 "maxOutputTokens": 150,
                 "topP": 0.9,
             },
+            "safetySettings": GEMINI_SAFETY_SETTINGS,
         }
         async with httpx.AsyncClient(timeout=25) as cx:
             r = await cx.post(url, json=body)
@@ -802,47 +808,75 @@ async def _call_gemini_chat(persona: str, history: List[HistoryItem], user_messa
 
 
 @api.post("/mitra/chat")
-async def mitra_chat(d: ChatIn, u=Depends(get_user_optional)):
-    # Detected mood from client wins over manual UI selection
-    effective_mood = d.detected_mood if d.detected_mood != "neutral" else d.mood
-    # Role context injected into persona
-    user_role = u.get("role", "elder") if u else "elder"
-    user_name = u["name"].split()[0] if u and u.get("name") else "friend"
-    role_ctx = {
-        "elder":     f"The user is an Elder (60+) named {user_name}. They may be lonely or isolated. Be warm, patient, and address them by name.",
-        "youth":     f"The user is a Youth member named {user_name}. They're young, digitally savvy, possibly stressed. Be energetic and relatable.",
-        "community": f"The user is a Community Organiser named {user_name}. They're action-oriented and social. Be collaborative and encouraging.",
-        "guardian":  f"The user is a Guardian named {user_name}. They care for an elderly loved one. Be reassuring and informative.",
-    }.get(user_role, f"The user is named {user_name}.")
-    persona = PERSONAS.get(effective_mood, PERSONAS["neutral"]) + " " + role_ctx
-    voice_params = VOICE_PARAMS.get(effective_mood, VOICE_PARAMS["neutral"])
+async def mitra_chat(d: ChatIn, u=Depends(get_user)):
+    # Safety first: check the message BEFORE anything is sent to Gemini.
+    risk = detect_crisis(d.message)
 
-    logging.info(f"[MITRA] user={u['id'] if u else 'anon'} role={user_role} detected_mood={d.detected_mood} ui_mood={d.mood} -> effective={effective_mood}")
+    if risk == "crisis":
+        # Never use the playful persona or Gemini for a crisis message.
+        # Reply with a fixed, reviewed message and real helplines.
+        reply = CRISIS_REPLY
+        effective_mood = "gentle"
+        voice_params = VOICE_PARAMS["sad"]
+        logging.warning(f"[MITRA] crisis-level message from user={u['id']}")
+    else:
+        # Detected mood from client wins over manual UI selection
+        effective_mood = d.detected_mood if d.detected_mood != "neutral" else d.mood
+        user_role = u.get("role", "elder")
+        user_name = u["name"].split()[0] if u.get("name") else "friend"
+        role_ctx = {
+            "elder":     f"The user is an Elder (60+) named {user_name}. They may be lonely or isolated. Be warm, patient, and address them by name.",
+            "youth":     f"The user is a Youth member named {user_name}. They're young, digitally savvy, possibly stressed. Be energetic and relatable.",
+            "community": f"The user is a Community Organiser named {user_name}. They're action-oriented and social. Be collaborative and encouraging.",
+            "guardian":  f"The user is a Guardian named {user_name}. They care for an elderly loved one. Be reassuring and informative.",
+        }.get(user_role, f"The user is named {user_name}.")
 
-    # Try Gemini with conversation history
-    reply = await _call_gemini_chat(persona, d.history, d.message)
+        if risk == "concern":
+            # Softer signs of distress: calm persona, no jokes, gentle check-in.
+            effective_mood = "gentle"
+            persona = CONCERN_PERSONA + " " + role_ctx + SAFETY_RULES
+        else:
+            persona = PERSONAS.get(effective_mood, PERSONAS["neutral"]) + " " + role_ctx + SAFETY_RULES
+        voice_params = VOICE_PARAMS.get(effective_mood, VOICE_PARAMS["neutral"])
 
-    # Fallback to curated responses if Gemini unavailable
-    if not reply:
-        reply = _fallback_reply(effective_mood)
+        logging.info(f"[MITRA] user={u['id']} role={user_role} detected_mood={d.detected_mood} ui_mood={d.mood} -> effective={effective_mood} risk={risk}")
+
+        # Try Gemini with conversation history
+        reply = await _call_gemini_chat(persona, d.history, d.message)
+
+        # Fallback to curated responses if Gemini unavailable
+        if not reply:
+            reply = _fallback_reply("sad" if risk == "concern" else effective_mood)
+
+        if risk == "concern":
+            reply = f"{reply}\n\n{helpline_line()}"
 
     # Store conversation
     try:
         await asyncio.to_thread(_sb_insert, "mitra_messages", {
             "id": str(uuid.uuid4()),
-            "user_id": u["id"] if u else None,
+            "user_id": u["id"],
             "message": d.message,
             "reply": reply,
             "mood": effective_mood,
+            "risk_level": risk,
             "ts": now_iso(),
         })
     except Exception:
         pass  # Don't fail the chat if DB write fails
 
-    if u:
+    if risk == "none":
         await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 2})
 
-    return {"reply": reply, "mood": effective_mood, "voice_params": voice_params}
+    return {
+        "reply": reply,
+        "mood": effective_mood,
+        "voice_params": voice_params,
+        "risk_level": risk,
+        "crisis": risk == "crisis",
+        "show_helpline": risk != "none",
+        "helplines": HELPLINES if risk != "none" else [],
+    }
 
 
 # ===== JOY CHALLENGE (role-based) =====
@@ -993,7 +1027,7 @@ async def organiser_create_event(d: OrgEventIn, u=Depends(get_user)):
     feed_text = f"📅 NEW EVENT: {d.title} — {d.date_str} at {d.venue}. {d.description or ''} Audience: {d.audience}. Price: {d.price}"
     post = {
         "id": event_id, "user_id": u["id"], "author": u["name"], "role": u["role"],
-        "text": feed_text, "category": "event", "image": image, "hearts": 0, "ts": now_iso(),
+        "text": feed_text, "category": "event", "image": image, "hearts": 0, "status": "visible", "ts": now_iso(),
         "event_meta": {"title": d.title, "date": d.date_str, "venue": d.venue,
                        "price": d.price, "audience": d.audience, "organiser_id": u["id"]},
     }
@@ -1057,7 +1091,7 @@ async def organiser_impact(u=Depends(get_user)):
 
 # ===== JOURNAL =====
 class JournalIn(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=5000)
     mood: Literal["bright", "calm", "tender", "heavy", "blue"] = "calm"
 
 
@@ -1066,7 +1100,11 @@ async def journal_add(d: JournalIn, u=Depends(get_user)):
     e = {"id": str(uuid.uuid4()), "user_id": u["id"], "text": d.text, "mood": d.mood, "ts": now_iso()}
     await asyncio.to_thread(_sb_insert, "journal", e)
     await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 5})
-    return e
+    # The entry stays private. If it shows signs of crisis, the app shows
+    # the helpline card to the writer (and only to them).
+    risk = detect_crisis(d.text)
+    return {**e, "risk_level": risk, "crisis": risk == "crisis",
+            "show_helpline": risk != "none", "helplines": HELPLINES if risk != "none" else []}
 
 
 @api.get("/journal")
@@ -1084,28 +1122,68 @@ FEED_IMAGES = {
 }
 
 
+POST_MAX_LENGTH = 1000
+REPORTS_TO_HIDE = 3  # a post is hidden for review after this many reports
+
+
 class PostIn(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=POST_MAX_LENGTH)
     category: Optional[str] = "general"
     image: Optional[str] = None
 
 
 @api.post("/feed")
 async def feed_post(d: PostIn, u=Depends(get_user)):
+    risk = detect_crisis(d.text)
+    # Crisis posts are held back from the public feed; the poster sees the helpline card.
+    status = "held" if risk == "crisis" else "visible"
     post = {"id": str(uuid.uuid4()), "user_id": u["id"], "author": u["name"], "role": u["role"],
             "text": d.text, "category": d.category, "image": d.image or FEED_IMAGES.get(d.category, FEED_IMAGES["general"]),
-            "hearts": 0, "ts": now_iso()}
+            "hearts": 0, "status": status, "ts": now_iso()}
     await asyncio.to_thread(_sb_insert, "posts", post)
-    await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 3})
-    return post
+    if status == "visible":
+        await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 3})
+    else:
+        logging.warning(f"[FEED] crisis-level post held from public view user={u['id']}")
+    return {**post, "held": status == "held", "risk_level": risk, "crisis": risk == "crisis",
+            "show_helpline": risk != "none", "helplines": HELPLINES if risk != "none" else []}
 
 
 @api.get("/feed")
 async def feed_list(u=Depends(get_user)):
-    items = await asyncio.to_thread(_sb_list, "posts")
+    items = await asyncio.to_thread(_sb_list, "posts", "status", "visible")
     if not items:
         items = _seed_posts()
     return items
+
+
+class ReportIn(BaseModel):
+    reason: str = Field("", max_length=500)
+
+
+@api.post("/feed/{post_id}/report")
+async def feed_report(post_id: str, d: ReportIn = Body(default_factory=ReportIn), u=Depends(get_user)):
+    """Report a post. After a few reports it is hidden until someone reviews it."""
+    post = await asyncio.to_thread(_sb_one, "posts", "id", post_id)
+    if not post:
+        raise HTTPException(404, "Post not found")
+    existing = await asyncio.to_thread(
+        lambda: supabase.table("post_reports").select("id")
+            .eq("post_id", post_id).eq("reporter_id", u["id"]).limit(1).execute()
+    )
+    if not existing.data:
+        await asyncio.to_thread(_sb_insert, "post_reports", {
+            "id": str(uuid.uuid4()), "post_id": post_id, "reporter_id": u["id"],
+            "reason": d.reason, "ts": now_iso(),
+        })
+    count_r = await asyncio.to_thread(
+        lambda: supabase.table("post_reports").select("id", count="exact").eq("post_id", post_id).execute()
+    )
+    reports = count_r.count or len(count_r.data)
+    if reports >= REPORTS_TO_HIDE and post.get("status") != "held":
+        await asyncio.to_thread(_sb_update, "posts", "id", post_id, {"status": "held"})
+        logging.warning(f"[FEED] post {post_id} hidden after {reports} reports")
+    return {"ok": True, "message": "Thanks for letting us know. We'll take a look."}
 
 
 @api.post("/feed/{post_id}/heart")

@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import confetti from "canvas-confetti";
 import { useNavigate } from "react-router-dom";
+import { DISCLAIMER } from "@/constants/helplines";
 
 const ROLES = [
   { id: "elder", label: "Elder (60+)", desc: "Feeling invisible after the kids moved away", color: "#F2A68A" },
@@ -190,7 +191,10 @@ export default function Onboarding({ onClose }) {
               {step === 0 && (
                 <>
                   <h2 className="font-display text-5xl md:text-6xl mb-2">WHO ARE YOU?</h2>
-                  <p className="label-mono text-[#A0A0A0] mb-8">Pick the one that feels closest</p>
+                  <p className="label-mono text-[#A0A0A0] mb-4">Pick the one that feels closest</p>
+                  <p className="text-sm text-[#F5F1E8] bg-[#1A1A1A] border border-[#333] rounded-sm p-3 mb-6" data-testid="onboarding-disclaimer">
+                    {DISCLAIMER} For mental-health support call Tele-MANAS on 14416 (free, 24x7).
+                  </p>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3" data-testid="onboarding-role-select">
                     {ROLES.map((r) => (
                       <button key={r.id} onClick={() => setData({ ...data, role: r.id })}
