@@ -2,6 +2,8 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import MitraOrb from "@/components/MitraOrb";
 import LaggingCursor from "@/components/Cursor";
+import { HelplineDialog } from "@/components/HelplineCard";
+import { useState } from "react";
 
 // Role-specific nav configs
 const NAV_BY_ROLE = {
@@ -64,6 +66,7 @@ export default function AppLayout({ children }) {
   const role = user?.role || "elder";
   const NAV = NAV_BY_ROLE[role] || NAV_BY_ROLE.elder;
   const accent = ROLE_COLOR[role];
+  const [helpOpen, setHelpOpen] = useState(false);
 
   return (
     <div className="min-h-screen bg-[#080808] text-white">
@@ -96,6 +99,10 @@ export default function AppLayout({ children }) {
 
           {/* User info + logout */}
           <div className="flex items-center gap-4">
+            <button onClick={() => setHelpOpen(true)} data-testid="need-help-btn"
+              className="text-xs font-semibold text-[#080808] bg-[#F5F1E8] px-3 py-1.5 rounded-sm hover:bg-white transition whitespace-nowrap">
+              Need help now?
+            </button>
             <div className="hidden md:block text-right">
               <p className="label-mono text-xs" style={{ color: accent }}>{user?.points ?? 0} pts</p>
               <p className="label-mono text-xs text-[#A0A0A0]">{user?.name?.split(" ")[0]}</p>
@@ -122,6 +129,7 @@ export default function AppLayout({ children }) {
       <main>{children}</main>
       <MitraOrb />
       <LaggingCursor />
+      <HelplineDialog open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { HelplineDialog } from "@/components/HelplineCard";
 
 const MOODS = [
   { id: "bright", color: "#C8F04B" },
@@ -13,15 +14,17 @@ export default function Journal() {
   const [entries, setEntries] = useState([]);
   const [text, setText] = useState("");
   const [mood, setMood] = useState("calm");
+  const [showHelp, setShowHelp] = useState(false);
 
   const load = () => api.get("/journal").then(r => setEntries(r.data));
   useEffect(() => { load(); }, []);
 
   const save = async () => {
     if (!text.trim()) return;
-    await api.post("/journal", { text, mood });
+    const r = await api.post("/journal", { text, mood });
     setText("");
     load();
+    if (r.data.show_helpline) setShowHelp(true);
   };
 
   return (
@@ -68,6 +71,12 @@ export default function Journal() {
           })}
         </div>
       </div>
+      <HelplineDialog
+        open={showHelp}
+        onClose={() => setShowHelp(false)}
+        title="Thank you for writing this down"
+        message="Your entry is saved and stays private. It sounds like things are really hard right now. You can talk to someone today."
+      />
     </div>
   );
 }

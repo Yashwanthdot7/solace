@@ -414,6 +414,12 @@ export default function Landing() {
             <p className="text-sm py-1 text-[#A0A0A0]">Indiranagar, Bengaluru</p>
           </div>
         </div>
+        <p className="mt-10 text-sm text-[#A0A0A0] max-w-3xl" data-testid="landing-disclaimer">
+          <strong className="text-white">Solace is not a medical service.</strong>{" "}
+          Mitra is an AI companion, not a doctor or therapist. In an emergency call{" "}
+          <a href="tel:112" className="underline text-white">112</a>. For mental-health support call Tele-MANAS on{" "}
+          <a href="tel:14416" className="underline text-white">14416</a> (free, 24x7).
+        </p>
       </section>
 
       {showOnboard && <Onboarding onClose={() => setShowOnboard(false)} />}

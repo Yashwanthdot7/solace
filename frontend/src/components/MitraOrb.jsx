@@ -4,6 +4,9 @@ import { api } from "@/lib/api";
 import { detectMood, MOOD_LABELS, MOOD_TO_UI } from "@/lib/moodDetect";
 import { X, Send, Mic, MicOff, Volume2, VolumeX } from "lucide-react";
 import VoiceWaveform from "@/components/VoiceWaveform";
+import { HelplineCard } from "@/components/HelplineCard";
+import { useAuth } from "@/contexts/AuthContext";
+import { DISCLAIMER } from "@/constants/helplines";
 
 const MAX_HISTORY = 8; // turns to send to backend
 
@@ -15,6 +18,7 @@ const UI_MOODS = [
 ];
 
 export default function MitraOrb() {
+  const { user } = useAuth();
   const [open, setOpen]           = useState(false);
   const [uiMood, setUiMood]       = useState("playful");  // manual override
   const [detectedMood, setDetected] = useState(null);     // auto-detected
@@ -104,6 +108,18 @@ export default function MitraOrb() {
     const userMsg = { role: "user", text: msg, detectedMood: detection.mood };
     setMessages(m => [...m, userMsg]);
     setInput("");
+
+    // Mitra needs an account (so we can follow up safely). Visitors who are
+    // not logged in still see the helplines straight away.
+    if (!user) {
+      setMessages(m => [...m, {
+        role: "mitra",
+        text: "I'd love to talk. Please create a free account or log in to chat with me. If you need help right now, you can call these numbers any time.",
+        helpline: true,
+      }]);
+      return;
+    }
+
     setLoading(true);
 
     // Build history for backend (last MAX_HISTORY turns, alternating user/mitra)
@@ -121,9 +137,19 @@ export default function MitraOrb() {
 
       const reply      = r.data.reply;
       const voiceParams = r.data.voice_params || detection.voice;
+      const crisis     = Boolean(r.data.crisis);
 
-      setMessages(m => [...m, { role: "mitra", text: reply, mood: r.data.mood }]);
-      speak(reply, voiceParams);
+      setMessages(m => [...m, {
+        role: "mitra", text: reply, mood: r.data.mood,
+        crisis, helpline: crisis,
+      }]);
+      if (crisis) {
+        // No upbeat voice for a crisis reply: stop anything playing and show the card.
+        stopSpeak();
+        setUiMood("gentle");
+      } else {
+        speak(reply, voiceParams);
+      }
     } catch {
       setMessages(m => [...m, { role: "mitra", text: "I'm here, but lost connection for a moment. Try again?" }]);
     } finally {
@@ -242,8 +268,13 @@ export default function MitraOrb() {
                         ? "bg-[#C8F04B] text-black"
                         : "bg-[#1A1622] text-white border border-[#B8A8E8]/20"
                     }`}>
-                      <p className="text-sm md:text-base leading-relaxed">{m.text}</p>
+                      <p className="text-sm md:text-base leading-relaxed whitespace-pre-line">{m.text}</p>
                     </div>
+                    {m.helpline && (
+                      <div className="mt-3 w-full max-w-[90%]">
+                        <HelplineCard compact />
+                      </div>
+                    )}
                     {/* Show detected mood tag on user messages */}
                     {m.role === "user" && m.detectedMood && m.detectedMood !== "neutral" && (
                       <span className="label-mono text-[10px] mt-1 px-2 py-0.5 rounded-full"
@@ -265,6 +296,8 @@ export default function MitraOrb() {
                   </div>
                 )}
               </div>
+
+              <p className="px-5 pb-2 text-xs text-[#888]" data-testid="mitra-disclaimer">{DISCLAIMER}</p>
 
               {/* Input bar */}
               <div className="p-5 border-t border-[#B8A8E8]/20 flex gap-2">

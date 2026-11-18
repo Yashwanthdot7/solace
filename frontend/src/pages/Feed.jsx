@@ -1,23 +1,51 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { Heart } from "lucide-react";
+import { Heart, Flag } from "lucide-react";
+import { toast } from "sonner";
+import { HelplineDialog } from "@/components/HelplineCard";
 import { motion } from "framer-motion";
 
 const ROLE_COLOR = { elder: "#F2A68A", youth: "#C8F04B", community: "#8BBF7A", guardian: "#E8854A" };
 const CATEGORIES = ["general", "recipe", "event", "hobby", "fitness"];
+const MAX_LEN = 1000;
 
 export default function Feed() {
   const [posts, setPosts] = useState([]);
   const [text, setText] = useState("");
   const [cat, setCat] = useState("general");
+  const [help, setHelp] = useState(null); // helpline dialog after a post
+  const [reported, setReported] = useState({});
 
   const load = () => api.get("/feed").then((r) => setPosts(r.data));
   useEffect(() => { load(); }, []);
 
   const submit = async () => {
     if (!text.trim()) return;
-    await api.post("/feed", { text, category: cat });
-    setText(""); load();
+    try {
+      const r = await api.post("/feed", { text: text.slice(0, MAX_LEN), category: cat });
+      setText(""); load();
+      if (r.data.held) {
+        setHelp({
+          title: "We're here for you",
+          message: "Your post has been kept private for now. It sounds like you're going through a lot. Please reach out to someone who can help.",
+        });
+      } else if (r.data.show_helpline) {
+        setHelp({ title: "Thank you for sharing", message: "If things feel heavy, support is a call away." });
+      }
+    } catch {
+      toast.error("Could not post. Please try again.");
+    }
+  };
+
+  const report = async (id) => {
+    if (reported[id]) return;
+    try {
+      await api.post(`/feed/${id}/report`, { reason: "" });
+      setReported((r) => ({ ...r, [id]: true }));
+      toast.success("Thanks for letting us know. We'll take a look.");
+    } catch {
+      toast.error("Could not send the report. Please try again.");
+    }
   };
 
   const heart = async (id) => {
@@ -33,9 +61,10 @@ export default function Feed() {
       <div className="grid md:grid-cols-12 gap-6">
         <div className="md:col-span-8 space-y-5">
           <div className="p-5 border border-[#1A1A1A] rounded-sm">
-            <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Share something kind…"
+            <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Share something kind…" maxLength={MAX_LEN}
               data-testid="feed-new-post-input"
               className="w-full bg-transparent border border-[#222] rounded-sm p-3 outline-none focus:border-[#C8F04B] resize-none" rows="2"/>
+            <p className="text-right text-xs text-[#666] mt-1">{text.length}/{MAX_LEN}</p>
             <div className="flex justify-between mt-2 gap-2 flex-wrap">
               <div className="flex gap-1.5">
                 {CATEGORIES.map(c => (
@@ -77,11 +106,20 @@ export default function Feed() {
                     <Heart size={16} fill={(p.hearts||0) > 0 ? "#F2A68A" : "none"} stroke={(p.hearts||0) > 0 ? "#F2A68A" : "currentColor"} /> {p.hearts || 0}
                   </button>
                   <span className="label-mono text-[#666]">+3 pts to {p.author?.split(" ")[0]}</span>
+                  {p.user_id && (
+                    <button onClick={() => report(p.id)} data-testid="community-post-report-btn"
+                      disabled={reported[p.id]}
+                      className="ml-auto flex items-center gap-1.5 label-mono text-[#666] hover:text-[#F2A68A] transition disabled:opacity-50">
+                      <Flag size={14} /> {reported[p.id] ? "Reported" : "Report"}
+                    </button>
+                  )}
                 </div>
               </div>
             </motion.div>
           ))}
         </div>
+
+        <HelplineDialog open={!!help} onClose={() => setHelp(null)} title={help?.title} message={help?.message} />
 
         <aside className="md:col-span-4 space-y-4">
           <div className="p-6 border border-[#1A1A1A] rounded-sm" data-testid="online-now">
