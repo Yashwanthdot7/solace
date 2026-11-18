@@ -34,6 +34,15 @@ SMTP_USER = os.environ.get('SMTP_USER', '')
 SMTP_PASS = os.environ.get('SMTP_PASS', '')
 SMTP_FROM = os.environ.get('SMTP_FROM', 'SOLACE <noreply@solace.in>')
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+# DEMO_MODE=true shows made-up demo members/messages. Never turn it on in production.
+DEMO_MODE = os.environ.get('DEMO_MODE', '').strip().lower() in ('1', 'true', 'yes')
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+
+def _gemini_headers() -> dict:
+    # The key goes in a header, not the URL, so it never ends up in logs.
+    return {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
 
 app = FastAPI(title="SOLACE API")
 api = APIRouter(prefix="/api")
@@ -280,6 +289,7 @@ class RegisterIn(BaseModel):
     name: str
     role: Literal["elder", "youth", "community", "guardian"] = "community"
     locality: Optional[str] = "Bengaluru"
+    accept_terms: bool = False  # must be true: agreed to the privacy policy and terms
 
 
 class LoginIn(BaseModel):
@@ -306,6 +316,8 @@ class ResetIn(BaseModel):
 @api.post("/auth/register")
 async def register(d: RegisterIn):
     """Register account. Email NOT verified yet — OTP is sent to inbox."""
+    if not d.accept_terms:
+        raise HTTPException(400, "Please agree to the privacy policy and terms to continue")
     existing = await asyncio.to_thread(_sb_one, "users", "email", d.email)
     if existing:
         if not existing.get("email_verified"):
@@ -322,6 +334,7 @@ async def register(d: RegisterIn):
         "points": 0, "streak": 1, "score": 72, "goals": [],
         "created_at": now_iso(), "guardian_email": None,
         "email_verified": False,
+        "consented_at": now_iso(),
     }
     try:
         await asyncio.to_thread(_sb_insert, "users", doc)
@@ -496,8 +509,20 @@ async def complete_onboarding(d: OnboardingIn, u=Depends(get_user)):
     pts = u["points"] + len(d.goals) * 5 + 25
     score = 60 + min(len(d.goals) * 4, 30)
     await asyncio.to_thread(_sb_update, "users", "id", u["id"], {
-        "goals": d.goals, "guardian_email": d.guardian_email, "points": pts, "score": score})
-    return {"points": pts, "score": score, "streak": 1, "joy_challenge": _today_challenge("elder")}
+        "goals": d.goals, "points": pts, "score": score})
+    # A guardian email from onboarding becomes an INVITE. The guardian sees
+    # nothing until they accept, and the member can revoke it in Settings.
+    guardian_invited = False
+    if d.guardian_email and d.guardian_email.strip():
+        try:
+            from email_validator import validate_email
+            email = validate_email(d.guardian_email.strip(), check_deliverability=False).normalized
+            await _create_invite(u, email)
+            guardian_invited = True
+        except Exception as e:
+            logging.info(f"[ONBOARDING] guardian invite skipped: {e}")
+    return {"points": pts, "score": score, "streak": 1, "joy_challenge": _today_challenge("elder"),
+            "guardian_invited": guardian_invited}
 
 
 # ===== GREETING =====
@@ -774,10 +799,6 @@ async def _call_gemini_chat(persona: str, history: List[HistoryItem], user_messa
     if not GEMINI_API_KEY:
         return None
     try:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        )
         # Build contents array: [history turns...] + current user message
         contents = []
         for h in history[-8:]:  # last 8 turns
@@ -796,7 +817,7 @@ async def _call_gemini_chat(persona: str, history: List[HistoryItem], user_messa
             "safetySettings": GEMINI_SAFETY_SETTINGS,
         }
         async with httpx.AsyncClient(timeout=25) as cx:
-            r = await cx.post(url, json=body)
+            r = await cx.post(GEMINI_URL, json=body, headers=_gemini_headers())
             if r.status_code == 200:
                 data = r.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -819,6 +840,7 @@ async def mitra_chat(d: ChatIn, u=Depends(get_user)):
         effective_mood = "gentle"
         voice_params = VOICE_PARAMS["sad"]
         logging.warning(f"[MITRA] crisis-level message from user={u['id']}")
+        await _alert_guardians_of_crisis(u)
     else:
         # Detected mood from client wins over manual UI selection
         effective_mood = d.detected_mood if d.detected_mood != "neutral" else d.mood
@@ -1103,6 +1125,8 @@ async def journal_add(d: JournalIn, u=Depends(get_user)):
     # The entry stays private. If it shows signs of crisis, the app shows
     # the helpline card to the writer (and only to them).
     risk = detect_crisis(d.text)
+    if risk == "crisis":
+        await _alert_guardians_of_crisis(u)
     return {**e, "risk_level": risk, "crisis": risk == "crisis",
             "show_helpline": risk != "none", "helplines": HELPLINES if risk != "none" else []}
 
@@ -1145,6 +1169,7 @@ async def feed_post(d: PostIn, u=Depends(get_user)):
         await asyncio.to_thread(_sb_inc, "users", "id", u["id"], {"points": 3})
     else:
         logging.warning(f"[FEED] crisis-level post held from public view user={u['id']}")
+        await _alert_guardians_of_crisis(u)
     return {**post, "held": status == "held", "risk_level": risk, "crisis": risk == "crisis",
             "show_helpline": risk != "none", "helplines": HELPLINES if risk != "none" else []}
 
@@ -1202,7 +1227,18 @@ def _seed_posts():
     ]
 
 
-# ===== GUARDIAN (real Supabase + baseline shift detection) =====
+# ===== GUARDIAN (two-sided consent + summary-only sharing) =====
+#
+# How guardian access works:
+#   1. A member invites a guardian by email (POST /guardian/invite).
+#   2. The guardian logs in and accepts (POST /guardian/accept/{id}).
+#   3. Only then can the guardian see a SUMMARY of the member's wellbeing.
+#   4. Either side can revoke at any time (POST /guardian/revoke/{id}),
+#      which cuts access immediately.
+#
+# Guardians NEVER see journal text, Mitra conversations or post text.
+# share_level "summary" (default): score, band, activity counts, trend.
+# share_level "moods" (member opt-in): the above plus mood labels.
 
 GUARDIAN_AVATARS = [
     "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=300&q=70",
@@ -1211,149 +1247,140 @@ GUARDIAN_AVATARS = [
     "https://images.unsplash.com/photo-1559963110-71b394e7494d?w=300&q=70",
 ]
 
-# Curated fallback members when no real linked users exist yet
-_FALLBACK_MEMBERS = [
-    {"id": "m1", "name": "Lakshmi Devi",    "relation": "Mother",      "age": 71, "score": 82, "band": "green",
-     "insight": "Active in community feed. Shared 3 recipes this week. Mood trending positive.",
-     "last_seen": "2 min ago", "avatar": GUARDIAN_AVATARS[0], "weekly": [70,74,78,80,82,82,82]},
-    {"id": "m2", "name": "Venkatesh Rao",    "relation": "Father",      "age": 68, "score": 54, "band": "amber",
-     "insight": "Tone shorter in 3 recent messages. Skipped 2 morning rituals. Suggest a check-in call.",
-     "last_seen": "1 hr ago",  "avatar": GUARDIAN_AVATARS[1], "weekly": [68,65,60,58,56,55,54]},
-    {"id": "m3", "name": "Saroja Aunty",      "relation": "Aunt",        "age": 76, "score": 91, "band": "green",
-     "insight": "Hosted Bingo Saturday. Great energy in journal entries.",
-     "last_seen": "12 min ago", "avatar": GUARDIAN_AVATARS[2], "weekly": [85,87,89,90,91,91,91]},
-    {"id": "m4", "name": "Raghavan Uncle",    "relation": "Father-in-law", "age": 79, "score": 38, "band": "red",
-     "insight": "⚠ No journal entries for 5 days. Last journal mood: heavy. Recommend a visit today.",
-     "last_seen": "8 hrs ago",  "avatar": GUARDIAN_AVATARS[3], "weekly": [55,50,45,42,40,39,38]},
+ShareLevel = Literal["summary", "moods"]
+CRISIS_ALERT_COOLDOWN = timedelta(hours=12)
+
+# Demo members, only shown when DEMO_MODE=true (never to real guardians).
+_DEMO_MEMBERS = [
+    {"id": "demo-m1", "name": "Demo Member (Lakshmi)", "relation": "Demo", "age": 71, "score": 82, "band": "green",
+     "insight": "Demo data: active in the community feed this week.",
+     "last_seen": "2 min ago", "avatar": GUARDIAN_AVATARS[0], "weekly": [70,74,78,80,82,82,82], "share_level": "summary"},
+    {"id": "demo-m2", "name": "Demo Member (Venkatesh)", "relation": "Demo", "age": 68, "score": 54, "band": "amber",
+     "insight": "Demo data: a little less active than usual. A check-in call could help.",
+     "last_seen": "1 hr ago", "avatar": GUARDIAN_AVATARS[1], "weekly": [68,65,60,58,56,55,54], "share_level": "summary"},
 ]
 
 
-async def _gemini_guardian_insight(name: str, evidence: dict, band: str) -> str:
-    """Call Gemini to generate a human-readable guardian insight from raw evidence."""
+async def _gemini_generate(prompt: str, max_tokens: int, timeout: int = 15) -> Optional[str]:
+    """One-shot Gemini call. Returns text or None."""
     if not GEMINI_API_KEY:
-        return _default_insight(band)
-    prompt = (
-        f"You are Solace's Guardian Monitor AI. Write a 2-3 sentence human-readable insight "
-        f"for a guardian about their family member named {name}. "
-        f"Evidence: {evidence}. "
-        f"Their current wellbeing band is: {band}. "
-        f"Be specific, compassionate, and actionable. Do NOT use bullet points. "
-        f"Write in plain English, as if speaking to a caring family member."
-    )
+        return None
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]},],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 100}}
-        async with httpx.AsyncClient(timeout=15) as cx:
-            r = await cx.post(url, json=body)
+        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.7, "maxOutputTokens": max_tokens},
+                "safetySettings": GEMINI_SAFETY_SETTINGS}
+        async with httpx.AsyncClient(timeout=timeout) as cx:
+            r = await cx.post(GEMINI_URL, json=body, headers=_gemini_headers())
             if r.status_code == 200:
                 return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
-        logging.warning(f"[GUARDIAN] Gemini insight failed: {e}")
-    return _default_insight(band)
+        logging.warning(f"[GUARDIAN] Gemini call failed: {e}")
+    return None
 
 
-async def _gemini_guardian_recommendations(name: str, events: list, band: str) -> list:
-    """Generate personalised recommendations via Gemini."""
-    if not GEMINI_API_KEY:
-        return _default_recommendations(band)
-    events_text = "; ".join([e.get("text", "") for e in events[:5]])
+async def _gemini_guardian_insight(evidence: dict, band: str) -> str:
+    """Human-readable insight. Only counts and the band are sent to Gemini:
+    no names, no text the member wrote."""
     prompt = (
-        f"Based on this week's activity for {name}: {events_text}. "
-        f"Their wellbeing band is {band}. "
-        f"Give 3 specific, warm, actionable recommendations for their guardian. "
-        f"Return as a JSON array of strings. Example: [\"Call them this evening\", \"...\", \"...\"]"
+        "You are Solace's guardian assistant. Write a 2-3 sentence, compassionate, actionable note "
+        "for a guardian about 'your family member'. Do not invent details. "
+        f"Activity counts: {evidence}. Wellbeing band: {band}. "
+        "No bullet points. Plain, warm English."
     )
+    return (await _gemini_generate(prompt, 100)) or _default_insight(band)
+
+
+async def _gemini_guardian_recommendations(evidence: dict, band: str) -> list:
+    """Recommendations for the guardian, from counts and band only."""
+    prompt = (
+        f"A family member's wellbeing band is {band}. Activity counts this week: {evidence}. "
+        "Give 3 specific, warm, actionable suggestions for their guardian. "
+        'Return only a JSON array of strings, e.g. ["Call them this evening", "...", "..."]'
+    )
+    text = await _gemini_generate(prompt, 200)
+    if not text:
+        return _default_recommendations(band)
+    import json as _json, re as _re
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        body = {"contents": [{"role": "user", "parts": [{"text": prompt}]},],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 200}}
-        async with httpx.AsyncClient(timeout=15) as cx:
-            r = await cx.post(url, json=body)
-            if r.status_code == 200:
-                text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                # 3-layer extraction
-                import json as _json, re as _re
-                # Layer 1: parse directly
-                try:
-                    return _json.loads(text)
-                except Exception:
-                    pass
-                # Layer 2: extract JSON array from markdown
-                m = _re.search(r'\[.*?\]', text, _re.DOTALL)
-                if m:
-                    try:
-                        return _json.loads(m.group())
-                    except Exception:
-                        pass
-                # Layer 3: split lines heuristically
-                lines = [l.strip().lstrip('"\'-123456789. ') for l in text.split('\n') if len(l.strip()) > 10]
-                return lines[:3] if lines else _default_recommendations(band)
-    except Exception as e:
-        logging.warning(f"[GUARDIAN] Gemini recommendations failed: {e}")
-    return _default_recommendations(band)
+        data = _json.loads(text)
+        if isinstance(data, list):
+            return [str(x) for x in data][:3]
+    except Exception:
+        pass
+    m = _re.search(r'\[.*?\]', text, _re.DOTALL)
+    if m:
+        try:
+            return [str(x) for x in _json.loads(m.group())][:3]
+        except Exception:
+            pass
+    lines = [l.strip().lstrip('"\'-123456789. ') for l in text.split('\n') if len(l.strip()) > 10]
+    return lines[:3] if lines else _default_recommendations(band)
 
 
 def _default_insight(band: str) -> str:
     return {
-        "green": "They seem to be doing well this week — active and engaged with the community.",
+        "green": "They seem to be doing well this week, active and engaged.",
         "amber": "There are some signs of reduced activity. A gentle check-in call would help.",
-        "red":   "⚠ Significant drop in activity detected. Please reach out to them today.",
+        "red":   "Activity has dropped noticeably. Please reach out to them today.",
     }.get(band, "Check in with them when you can.")
 
 
 def _default_recommendations(band: str) -> list:
     return {
         "green": ["Keep celebrating their wins", "Plan a visit this weekend", "Share a family photo"],
-        "amber": ["Call them this evening — even 5 minutes helps", "Share an old family photo", "Suggest they join Monday's group prayer"],
-        "red":   ["Visit them today if possible", "Notify other family members", "Contact Solace's community support team"],
+        "amber": ["Call them this evening, even 5 minutes helps", "Share an old family photo", "Suggest a community event they might enjoy"],
+        "red":   ["Visit or call them today if possible", "Let other close family know", "If you are worried about their safety, call Tele-MANAS on 14416 for advice"],
     }.get(band, ["Call them today", "Check in via chat", "Plan a visit"])
 
 
-async def _analyze_member(member_user: dict, avatar: str) -> dict:
-    """Compute real baseline metrics for a guardian member."""
+def _weekday(ts: str) -> str:
+    try:
+        d = datetime.fromisoformat(ts)
+        return d.strftime("%a")
+    except Exception:
+        return "?"
+
+
+async def _count(table: str, uid: str, since: str) -> int:
+    r = await asyncio.to_thread(
+        lambda: supabase.table(table).select("id", count="exact").eq("user_id", uid).gte("ts", since).execute())
+    return r.count or len(r.data)
+
+
+async def _analyze_member(member_user: dict, avatar: str, share_level: str = "summary") -> Optional[dict]:
+    """Wellbeing summary for one member, as a guardian is allowed to see it."""
     uid = member_user["id"]
     now = datetime.now(timezone.utc)
     cutoff_30d = (now - timedelta(days=30)).isoformat()
     cutoff_7d  = (now - timedelta(days=7)).isoformat()
 
     try:
-        # Message counts
-        msgs_30 = await asyncio.to_thread(lambda: supabase.table("mitra_messages").select("id",count="exact").eq("user_id",uid).gte("ts",cutoff_30d).execute())
-        msgs_7  = await asyncio.to_thread(lambda: supabase.table("mitra_messages").select("id",count="exact").eq("user_id",uid).gte("ts",cutoff_7d).execute())
-        msg_30d = (msgs_30.count or len(msgs_30.data))
-        msg_7d  = (msgs_7.count  or len(msgs_7.data))
+        msg_30d = await _count("mitra_messages", uid, cutoff_30d)
+        msg_7d  = await _count("mitra_messages", uid, cutoff_7d)
         msg_daily_avg_30 = max(1, msg_30d / 30)
         msg_daily_avg_7  = max(0, msg_7d / 7)
 
-        # Journal
-        jnl_30 = await asyncio.to_thread(lambda: supabase.table("journal").select("id,mood",count="exact").eq("user_id",uid).gte("ts",cutoff_30d).execute())
-        jnl_7  = await asyncio.to_thread(lambda: supabase.table("journal").select("id,mood").eq("user_id",uid).gte("ts",cutoff_7d).execute())
-        jnl_30d = (jnl_30.count or len(jnl_30.data))
-        jnl_7d  = len(jnl_7.data)
-        heavy_ratio = sum(1 for j in jnl_7.data if j.get("mood") in ("heavy","blue")) / max(1, jnl_7d)
+        jnl_30d = await _count("journal", uid, cutoff_30d)
+        jnl_7 = await asyncio.to_thread(lambda: supabase.table("journal").select("id,mood").eq("user_id", uid).gte("ts", cutoff_7d).execute())
+        jnl_7d = len(jnl_7.data)
+        heavy_ratio = sum(1 for j in jnl_7.data if j.get("mood") in ("heavy", "blue")) / max(1, jnl_7d)
 
-        # Joy completions
-        joy_7 = await asyncio.to_thread(lambda: supabase.table("joy_completions").select("id",count="exact").eq("user_id",uid).gte("ts",cutoff_7d).execute())
-        joy_7d = (joy_7.count or len(joy_7.data))
+        joy_7d = await _count("joy_completions", uid, cutoff_7d)
 
-        # Last activity
         last_msg = await asyncio.to_thread(_sb_list, "mitra_messages", "user_id", uid, "ts", True, 1)
         last_ts = last_msg[0]["ts"] if last_msg else None
         hours_silent = 0
         if last_ts:
             try:
                 lt = datetime.fromisoformat(last_ts)
-                if lt.tzinfo is None: lt = lt.replace(tzinfo=timezone.utc)
+                if lt.tzinfo is None:
+                    lt = lt.replace(tzinfo=timezone.utc)
                 hours_silent = (now - lt).total_seconds() / 3600
             except Exception:
                 hours_silent = 0
 
-        # Z-score shift: how many standard deviations below 30d avg is 7d avg?
         msg_ratio = msg_daily_avg_7 / msg_daily_avg_30 if msg_30d > 0 else 1.0
-        jnl_ratio = (jnl_7d / 7) / (jnl_30d / 30) if jnl_30d > 0 else 1.0
 
-        # Determine band
         if hours_silent > 72 or msg_ratio < 0.3 or heavy_ratio > 0.6 or joy_7d == 0:
             band = "red"
         elif hours_silent > 24 or msg_ratio < 0.5 or heavy_ratio > 0.3:
@@ -1361,166 +1388,279 @@ async def _analyze_member(member_user: dict, avatar: str) -> dict:
         else:
             band = "green"
 
-        # Build score (0-100)
-        score = int(
-            min(100, max(0,
-                (msg_ratio * 40) +
-                ((1 - heavy_ratio) * 35) +
-                (min(1, joy_7d / 4) * 25)
-            ))
-        )
+        score = int(min(100, max(0, (msg_ratio * 40) + ((1 - heavy_ratio) * 35) + (min(1, joy_7d / 4) * 25))))
 
-        # Build evidence dict for Gemini
+        # Only counts go to Gemini. Mood information only if the member chose to share it.
         evidence = {
-            "messages_last_7d": msg_7d,
-            "messages_daily_avg_30d": round(msg_daily_avg_30, 1),
-            "journal_entries_7d": jnl_7d,
-            "heavy_mood_ratio": round(heavy_ratio, 2),
-            "joy_completions_7d": joy_7d,
+            "mitra_chats_last_7d": msg_7d,
+            "journal_entries_last_7d": jnl_7d,
+            "joy_challenges_last_7d": joy_7d,
             "hours_since_last_activity": round(hours_silent, 1),
         }
+        if share_level == "moods":
+            evidence["share_of_heavy_moods_7d"] = round(heavy_ratio, 2)
 
-        # Generate Gemini insight for amber/red
-        if band in ("amber", "red"):
-            insight = await _gemini_guardian_insight(member_user["name"], evidence, band)
-        else:
-            insight = _default_insight(band)
+        insight = await _gemini_guardian_insight(evidence, band) if band in ("amber", "red") else _default_insight(band)
+        last_seen = f"{int(hours_silent)} hr{'s' if int(hours_silent) != 1 else ''} ago" if hours_silent >= 1 else "recently"
+        weekly = [max(0, min(100, score + d)) for d in [-8, -5, -3, -1, 0, 0, 0]]
 
-        last_seen = f"{int(hours_silent)} hr{'s' if hours_silent != 1 else ''} ago" if hours_silent >= 1 else "recently"
-
-        # Build weekly trend (approximate from score)
-        weekly = [max(0, min(100, score + d)) for d in [-8, -5, -3, -1, 0, 0, score]]
-
+        # Whitelist: nothing else from the member's account is exposed.
         return {
-            **{k: v for k, v in member_user.items() if k not in ("password", "email")},
+            "id": uid,
+            "name": member_user.get("name", "Family member"),
+            "relation": "Family member",
+            "age": member_user.get("age"),
             "score": score,
             "band": band,
             "insight": insight,
             "last_seen": last_seen,
             "avatar": avatar,
             "weekly": weekly,
-            "relation": "Member",
-            "age": member_user.get("age", 0),
+            "share_level": share_level,
+            "evidence": evidence,
         }
     except Exception as e:
         logging.error(f"[GUARDIAN] analyze_member {uid}: {e}")
         return None
 
 
+def _link_view(link: dict) -> dict:
+    keep = ("id", "member_id", "member_name", "guardian_email", "status", "share_level",
+            "alert_on_crisis", "created_at", "accepted_at")
+    return {k: link.get(k) for k in keep}
+
+
+async def _get_link(link_id: str) -> dict:
+    link = await asyncio.to_thread(_sb_one, "guardian_links", "id", link_id)
+    if not link:
+        raise HTTPException(404, "Link not found")
+    return link
+
+
+async def _active_links_for_guardian(u: dict) -> list:
+    r = await asyncio.to_thread(
+        lambda: supabase.table("guardian_links").select("*")
+            .eq("guardian_id", u["id"]).eq("status", "active").execute())
+    return r.data or []
+
+
+def _guardian_invite_html(member_name: str, accept_url: str) -> str:
+    return f"""<!DOCTYPE html><html><body style="margin:0;background:#080808;font-family:Arial,sans-serif;color:#fff">
+<div style="max-width:520px;margin:40px auto;padding:40px;background:#0f0f0f;border:1px solid #1e1e1e">
+  <p style="font-size:28px;font-weight:900">SOLACE<span style="color:#C8F04B">.</span></p>
+  <h1 style="font-size:26px">{member_name} invited you to be their guardian</h1>
+  <p style="color:#bbb">If you accept, you will see a short weekly summary of how they are doing
+  (a wellbeing score and how active they have been). You will never see their journal,
+  their conversations with Mitra, or what they post. They can stop sharing at any time.</p>
+  <p><a href="{accept_url}" style="display:inline-block;background:#C8F04B;color:#080808;padding:14px 32px;text-decoration:none;font-weight:700">Log in to accept</a></p>
+  <p style="color:#666;font-size:12px">If you don't know this person, ignore this email.</p>
+</div></body></html>"""
+
+
+def _crisis_alert_html(first_name: str) -> str:
+    return f"""<!DOCTYPE html><html><body style="margin:0;background:#080808;font-family:Arial,sans-serif;color:#fff">
+<div style="max-width:520px;margin:40px auto;padding:40px;background:#0f0f0f;border:1px solid #1e1e1e">
+  <p style="font-size:28px;font-weight:900">SOLACE<span style="color:#C8F04B">.</span></p>
+  <h1 style="font-size:24px">{first_name} may need support right now</h1>
+  <p style="color:#ddd">Something {first_name} shared in Solace suggests they may be going through a very hard time.
+  Please check in with them soon, gently and without judgement. Solace does not share what they wrote.</p>
+  <p style="color:#ddd">If you think they are in immediate danger, call <strong>112</strong>.
+  For advice on how to help, call <strong>Tele-MANAS on 14416</strong> (free, 24x7).</p>
+  <p style="color:#666;font-size:12px">You get this email because {first_name} asked Solace to alert you if they seem to be in crisis.</p>
+</div></body></html>"""
+
+
+async def _alert_guardians_of_crisis(member: dict):
+    """Email guardians the member opted in to alert. No content is shared.
+    At most one alert per guardian every 12 hours."""
+    try:
+        r = await asyncio.to_thread(
+            lambda: supabase.table("guardian_links").select("*")
+                .eq("member_id", member["id"]).eq("status", "active").eq("alert_on_crisis", True).execute())
+        now = datetime.now(timezone.utc)
+        first = (member.get("name") or "Your family member").split(" ")[0]
+        for link in r.data or []:
+            last = link.get("last_alert_at")
+            if last:
+                try:
+                    lt = datetime.fromisoformat(last)
+                    if lt.tzinfo is None:
+                        lt = lt.replace(tzinfo=timezone.utc)
+                    if now - lt < CRISIS_ALERT_COOLDOWN:
+                        continue
+                except ValueError:
+                    pass
+            await send_email(link["guardian_email"], f"{first} may need support", _crisis_alert_html(first))
+            await asyncio.to_thread(_sb_update, "guardian_links", "id", link["id"], {"last_alert_at": now.isoformat()})
+            logging.info(f"[GUARDIAN] crisis alert sent for member={member['id']} link={link['id']}")
+    except Exception as e:
+        logging.error(f"[GUARDIAN] crisis alert failed: {e}")
+
+
+class GuardianInviteIn(BaseModel):
+    guardian_email: EmailStr
+    share_level: ShareLevel = "summary"
+    alert_on_crisis: bool = False
+
+
+class GuardianLinkUpdateIn(BaseModel):
+    share_level: Optional[ShareLevel] = None
+    alert_on_crisis: Optional[bool] = None
+
+
+async def _create_invite(member: dict, guardian_email: str, share_level: str = "summary",
+                         alert_on_crisis: bool = False) -> dict:
+    email = guardian_email.strip().lower()
+    if email == (member.get("email") or "").lower():
+        raise HTTPException(400, "You can't be your own guardian")
+    existing = await asyncio.to_thread(
+        lambda: supabase.table("guardian_links").select("*")
+            .eq("member_id", member["id"]).eq("guardian_email", email).execute())
+    if any(l.get("status") in ("pending", "active") for l in (existing.data or [])):
+        raise HTTPException(400, "You've already invited this person")
+    link = {
+        "id": str(uuid.uuid4()), "member_id": member["id"], "member_name": member.get("name"),
+        "guardian_email": email, "guardian_id": None, "status": "pending",
+        "share_level": share_level, "alert_on_crisis": alert_on_crisis,
+        "created_at": now_iso(), "accepted_at": None, "revoked_at": None, "last_alert_at": None,
+    }
+    await asyncio.to_thread(_sb_insert, "guardian_links", link)
+    await send_email(email, f"{member.get('name', 'Someone')} invited you to Solace",
+                     _guardian_invite_html(member.get("name", "Someone"), f"{FRONTEND_URL}/guardian"))
+    return link
+
+
+@api.post("/guardian/invite")
+async def guardian_invite(d: GuardianInviteIn, u=Depends(get_user)):
+    """A member invites someone to be their guardian. Nothing is shared until they accept."""
+    link = await _create_invite(u, d.guardian_email, d.share_level, d.alert_on_crisis)
+    return _link_view(link)
+
+
+@api.get("/me/guardians")
+async def my_guardians(u=Depends(get_user)):
+    """The member's own list of who can (or has been asked to) see their wellbeing."""
+    r = await asyncio.to_thread(
+        lambda: supabase.table("guardian_links").select("*").eq("member_id", u["id"]).execute())
+    return [_link_view(l) for l in (r.data or []) if l.get("status") in ("pending", "active")]
+
+
+@api.get("/guardian/invites")
+async def guardian_invites(u=Depends(get_user)):
+    """Invitations waiting for this user to accept."""
+    r = await asyncio.to_thread(
+        lambda: supabase.table("guardian_links").select("*")
+            .eq("guardian_email", (u.get("email") or "").lower()).eq("status", "pending").execute())
+    return [_link_view(l) for l in (r.data or []) if l.get("member_id") != u["id"]]
+
+
+@api.post("/guardian/accept/{link_id}")
+async def guardian_accept(link_id: str, u=Depends(get_user)):
+    link = await _get_link(link_id)
+    if link.get("guardian_email") != (u.get("email") or "").lower():
+        raise HTTPException(403, "This invitation was sent to a different email")
+    if link.get("status") != "pending":
+        raise HTTPException(400, "This invitation is no longer open")
+    await asyncio.to_thread(_sb_update, "guardian_links", "id", link_id,
+                            {"status": "active", "guardian_id": u["id"], "accepted_at": now_iso()})
+    return {"ok": True, "status": "active"}
+
+
+@api.post("/guardian/revoke/{link_id}")
+async def guardian_revoke(link_id: str, u=Depends(get_user)):
+    """Either the member or the guardian can end (or decline) a link. Access stops at once."""
+    link = await _get_link(link_id)
+    is_member = link.get("member_id") == u["id"]
+    is_guardian = link.get("guardian_id") == u["id"] or link.get("guardian_email") == (u.get("email") or "").lower()
+    if not (is_member or is_guardian):
+        raise HTTPException(403, "Not your link")
+    await asyncio.to_thread(_sb_update, "guardian_links", "id", link_id,
+                            {"status": "revoked", "revoked_at": now_iso()})
+    return {"ok": True, "status": "revoked"}
+
+
+@api.patch("/guardian/links/{link_id}")
+async def guardian_link_update(link_id: str, d: GuardianLinkUpdateIn, u=Depends(get_user)):
+    """Only the member can change what a guardian sees."""
+    link = await _get_link(link_id)
+    if link.get("member_id") != u["id"]:
+        raise HTTPException(403, "Only the member can change sharing settings")
+    updates = {k: v for k, v in d.model_dump().items() if v is not None}
+    if updates:
+        await asyncio.to_thread(_sb_update, "guardian_links", "id", link_id, updates)
+    return _link_view({**link, **updates})
+
+
 @api.get("/guardian/members")
 async def guardian_members(u=Depends(get_user)):
-    # Find real users who listed this guardian's email as their guardian_email
-    try:
-        real_members_r = await asyncio.to_thread(
-            lambda: supabase.table("users")
-                .select("*").eq("guardian_email", u["email"]).execute()
-        )
-        real_members = real_members_r.data or []
-    except Exception:
-        real_members = []
-
-    if real_members:
-        avatars = GUARDIAN_AVATARS
-        tasks = [
-            _analyze_member(m, avatars[i % len(avatars)])
-            for i, m in enumerate(real_members)
-        ]
-        results = await asyncio.gather(*tasks)
-        members = [r for r in results if r is not None]
-        logging.info(f"[GUARDIAN] Returning {len(members)} real member(s) for {u['email']}")
-        return members
-
-    # No real linked members yet — return curated fallback
-    logging.info(f"[GUARDIAN] No linked members for {u['email']} — using fallback data")
-    return _FALLBACK_MEMBERS
+    links = await _active_links_for_guardian(u)
+    results = []
+    for i, link in enumerate(links):
+        member = await asyncio.to_thread(_sb_one, "users", "id", link["member_id"])
+        if not member:
+            continue
+        m = await _analyze_member(member, GUARDIAN_AVATARS[i % len(GUARDIAN_AVATARS)], link.get("share_level", "summary"))
+        if m:
+            m.pop("evidence", None)
+            results.append(m)
+    if not results and DEMO_MODE:
+        return _DEMO_MEMBERS
+    return results
 
 
 @api.get("/guardian/report/{member_id}")
 async def guardian_report(member_id: str, u=Depends(get_user)):
-    # Try to find real member
+    links = await _active_links_for_guardian(u)
+    link = next((l for l in links if l.get("member_id") == member_id), None)
+
+    if not link:
+        demo = next((m for m in _DEMO_MEMBERS if m["id"] == member_id), None) if DEMO_MODE else None
+        if demo:
+            return {"member": demo, "weekly_score": demo["weekly"],
+                    "events": [{"date": "Mon", "type": "chat", "text": "Demo: chatted with Mitra"}],
+                    "recommendations": _default_recommendations(demo["band"])}
+        raise HTTPException(404, "No active link with this member")
+
+    member_user = await asyncio.to_thread(_sb_one, "users", "id", member_id)
+    if not member_user:
+        raise HTTPException(404, "Member not found")
+    share_level = link.get("share_level", "summary")
+    show_moods = share_level == "moods"
+    uid = member_user["id"]
+
     try:
-        real_members_r = await asyncio.to_thread(
-            lambda: supabase.table("users")
-                .select("*").eq("guardian_email", u["email"]).execute()
-        )
-        real_members = real_members_r.data or []
-        member_user = next((m for m in real_members if m["id"] == member_id), None)
-    except Exception:
-        member_user = None
+        msgs     = await asyncio.to_thread(_sb_list, "mitra_messages", "user_id", uid, "ts", True, 5)
+        journals = await asyncio.to_thread(_sb_list, "journal", "user_id", uid, "ts", True, 10)
+        joys     = await asyncio.to_thread(_sb_list, "joy_completions", "user_id", uid, "ts", True, 10)
+        posts    = await asyncio.to_thread(_sb_list, "posts", "user_id", uid, "ts", True, 10)
 
-    if member_user:
-        uid = member_user["id"]
-        cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        # Activity timeline: what kind of activity and when. Never the content.
+        raw_events = []
+        for m in msgs:
+            extra = f" · mood: {m.get('mood')}" if show_moods and m.get("mood") else ""
+            raw_events.append({"ts": m["ts"], "type": "chat", "text": f"Chatted with Mitra{extra}"})
+        for j in journals:
+            extra = f" · mood: {j.get('mood')}" if show_moods and j.get("mood") else ""
+            raw_events.append({"ts": j["ts"], "type": "journal", "text": f"Wrote in their journal{extra}"})
+        for j in joys:
+            raw_events.append({"ts": j["ts"], "type": "joy", "text": "Completed the daily joy challenge"})
+        for p in posts:
+            if p.get("status", "visible") == "visible":
+                raw_events.append({"ts": p["ts"], "type": "event", "text": "Posted in the community feed"})
+        raw_events.sort(key=lambda x: x.get("ts", ""), reverse=True)
+        events = [{"date": _weekday(e["ts"]), **e} for e in raw_events[:7]]
+    except Exception as e:
+        logging.error(f"[GUARDIAN] report activity pull {uid}: {e}")
+        events = [{"date": "?", "type": "rest", "text": "Activity data unavailable"}]
 
-        # Pull real activity
-        try:
-            msgs     = await asyncio.to_thread(_sb_list, "mitra_messages", "user_id", uid, "ts", True, 20)
-            journals = await asyncio.to_thread(_sb_list, "journal", "user_id", uid, "ts", True, 10)
-            joys     = await asyncio.to_thread(_sb_list, "joy_completions", "user_id", uid, "ts", True, 10)
-            posts    = await asyncio.to_thread(_sb_list, "posts", "user_id", uid, "ts", True, 10)
-
-            # Build events timeline
-            raw_events = []
-            for m in msgs[:5]:
-                raw_events.append({"ts": m["ts"], "type": "chat", "text": f"Sent a message to Mitra · mood: {m.get('mood','?')}"})
-            for j in journals:
-                raw_events.append({"ts": j["ts"], "type": "journal", "text": f"Wrote in journal · mood: {j.get('mood','?')}"})
-            for j in joys:
-                raw_events.append({"ts": j["ts"], "type": "joy", "text": "Completed today's joy challenge"})
-            for p in posts:
-                raw_events.append({"ts": p["ts"], "type": "event", "text": f"Posted in community feed: {p.get('text','')[:40]}…"})
-
-            # Sort by ts descending, take last 7
-            raw_events.sort(key=lambda x: x.get("ts", ""), reverse=True)
-            days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-            events = [{"date": days[i % 7], **e} for i, e in enumerate(raw_events[:7])]
-
-        except Exception as e:
-            logging.error(f"[GUARDIAN] report activity pull {uid}: {e}")
-            events = [{"date": "?", "type": "rest", "text": "Activity data unavailable"}]
-
-        # Compute member profile
-        avatar = GUARDIAN_AVATARS[0]
-        m_data = await _analyze_member(member_user, avatar)
-        if not m_data:
-            m_data = {"name": member_user["name"], "band": "green", "score": 72}
-
-        # Gemini recommendations from real activity
-        recommendations = await _gemini_guardian_recommendations(
-            member_user["name"], events, m_data.get("band", "green")
-        )
-
-        return {"member": m_data, "events": events, "recommendations": recommendations}
-
-    # Fallback to curated data
-    members = _FALLBACK_MEMBERS
-    m = next((x for x in members if x["id"] == member_id), members[0])
-    band = m["band"]
-    return {
-        "member": m,
-        "events": [
-            {"date": "Mon", "type": "chat",    "text": "Replied warmly to 4 messages"},
-            {"date": "Tue", "type": "journal",  "text": "Wrote 1 entry · mood: tender"},
-            {"date": "Wed", "type": "skip",     "text": "Skipped morning ritual"},
-            {"date": "Thu", "type": "chat",    "text": "Mentioned 'tired' twice"},
-            {"date": "Fri", "type": "joy",      "text": "Completed joy challenge"},
-            {"date": "Sat", "type": "event",    "text": "Attended bingo session"},
-            {"date": "Sun", "type": "rest",     "text": "Quiet day"},
-        ],
-        "recommendations": _default_recommendations(band),
-    }
-
-
-class AddMemberIn(BaseModel):
-    name: str
-    relation: str
-    age: int
-
-
-@api.post("/guardian/add")
-async def guardian_add(d: AddMemberIn, u=Depends(get_user)):
-    return {"id": str(uuid.uuid4()), "name": d.name, "relation": d.relation, "age": d.age,
-            "score": 72, "band": "green", "added": True}
+    m_data = await _analyze_member(member_user, GUARDIAN_AVATARS[0], share_level)
+    if not m_data:
+        m_data = {"id": uid, "name": member_user.get("name"), "band": "green", "score": 72,
+                  "weekly": [72] * 7, "evidence": {}, "share_level": share_level}
+    evidence = m_data.pop("evidence", {})
+    recommendations = await _gemini_guardian_recommendations(evidence, m_data.get("band", "green"))
+    return {"member": m_data, "weekly_score": m_data.get("weekly", []), "events": events,
+            "recommendations": recommendations}
 
 
 # ===== EVENTS (Gemini search grounding + 6hr cache) =====
@@ -1579,17 +1719,13 @@ async def _fetch_live_events() -> list:
     if not GEMINI_API_KEY:
         return []
     try:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        )
         body = {
             "contents": [{"role": "user", "parts": [{"text": _GEMINI_EVENTS_PROMPT}]}],
             "tools": [{"google_search": {}}],
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 800},
         }
         async with httpx.AsyncClient(timeout=30) as cx:
-            r = await cx.post(url, json=body)
+            r = await cx.post(GEMINI_URL, json=body, headers=_gemini_headers())
             if r.status_code == 200:
                 text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 events = _extract_events_json(text)
@@ -1822,12 +1958,62 @@ async def organiser_active():
 # ===== CHAT =====
 @api.get("/chat/messages")
 async def chat_messages():
+    # Group chat is not built yet (see Phase 5 of the plan). Only show
+    # made-up demo messages when DEMO_MODE is on.
+    if not DEMO_MODE:
+        return []
     return [
-        {"id": "c1", "author": "Venkat Uncle", "text": "Feeling a bit low today, again.", "ts": now_iso(), "ai_notice": True},
-        {"id": "c2", "author": "Priya M", "text": "Sending love, Venkat ji. Want to join the 7 AM prayer call tomorrow?", "ts": now_iso()},
-        {"id": "c3", "author": "Arjun K", "text": "I'm there too uncle, let's all go together", "ts": now_iso()},
-        {"id": "c4", "author": "Lakshmi Auntie", "text": "I'll bring my idlis for breakfast after 🌸", "ts": now_iso()},
+        {"id": "c1", "author": "Demo Priya", "text": "Demo: anyone joining the 7 AM prayer call tomorrow?", "ts": now_iso()},
+        {"id": "c2", "author": "Demo Arjun", "text": "Demo: I'm there too, let's all go together", "ts": now_iso()},
     ]
+
+
+# ===== DATA RIGHTS: export and delete =====
+
+USER_TABLES = ["mitra_messages", "journal", "joy_completions", "posts", "rsvps", "hobbies", "wellness_log"]
+
+
+@api.get("/me/export")
+async def export_my_data(u=Depends(get_user)):
+    """Everything Solace stores about you, as JSON."""
+    data = {"exported_at": now_iso(), "account": public_user(u)}
+    for t in USER_TABLES:
+        data[t] = await asyncio.to_thread(_sb_list, t, "user_id", u["id"], "ts", True, 10000)
+    links = await asyncio.to_thread(
+        lambda: supabase.table("guardian_links").select("*").eq("member_id", u["id"]).execute())
+    data["my_guardians"] = [_link_view(l) for l in (links.data or [])]
+    as_guardian = await asyncio.to_thread(
+        lambda: supabase.table("guardian_links").select("*").eq("guardian_id", u["id"]).execute())
+    data["people_i_look_after"] = [_link_view(l) for l in (as_guardian.data or [])]
+    reports = await asyncio.to_thread(
+        lambda: supabase.table("post_reports").select("*").eq("reporter_id", u["id"]).execute())
+    data["post_reports"] = reports.data or []
+    return data
+
+
+class DeleteMeIn(BaseModel):
+    password: str
+
+
+@api.delete("/me")
+async def delete_my_account(d: DeleteMeIn, u=Depends(get_user)):
+    """Permanently delete your account and everything linked to it."""
+    full = await asyncio.to_thread(_sb_one, "users", "id", u["id"])
+    if not full or not verify_pw(d.password, full.get("password", "")):
+        raise HTTPException(401, "Password is incorrect")
+    uid, email = u["id"], (u.get("email") or "").lower()
+    for t in USER_TABLES:
+        await asyncio.to_thread(_sb_delete, t, "user_id", uid)
+    await asyncio.to_thread(_sb_delete, "post_reports", "reporter_id", uid)
+    await asyncio.to_thread(_sb_delete, "guardian_links", "member_id", uid)
+    await asyncio.to_thread(_sb_delete, "guardian_links", "guardian_id", uid)
+    if email:
+        await asyncio.to_thread(_sb_delete, "guardian_links", "guardian_email", email)
+    await asyncio.to_thread(_sb_delete, "otps", "email", u.get("email"))
+    await asyncio.to_thread(_sb_delete, "password_resets", "email", u.get("email"))
+    await asyncio.to_thread(_sb_delete, "users", "id", uid)
+    logging.info(f"[ACCOUNT] deleted user={uid}")
+    return {"deleted": True}
 
 
 app.include_router(api)

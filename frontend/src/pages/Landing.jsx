@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import MarqueeStrip from "@/components/MarqueeStrip";
@@ -418,7 +419,9 @@ export default function Landing() {
           <strong className="text-white">Solace is not a medical service.</strong>{" "}
           Mitra is an AI companion, not a doctor or therapist. In an emergency call{" "}
           <a href="tel:112" className="underline text-white">112</a>. For mental-health support call Tele-MANAS on{" "}
-          <a href="tel:14416" className="underline text-white">14416</a> (free, 24x7).
+          <a href="tel:14416" className="underline text-white">14416</a> (free, 24x7).{" "}
+          <Link to="/privacy" className="underline text-white">Privacy policy</Link> ·{" "}
+          <Link to="/terms" className="underline text-white">Terms</Link>
         </p>
       </section>
 

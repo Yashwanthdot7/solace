@@ -13,6 +13,9 @@ import Events from "@/pages/Events";
 import Mindfulness from "@/pages/Mindfulness";
 import Journal from "@/pages/Journal";
 import ResetPassword from "@/pages/ResetPassword";
+import Settings from "@/pages/Settings";
+import Privacy from "@/pages/Privacy";
+import Terms from "@/pages/Terms";
 import { Toaster } from "sonner";
 
 function PageWrap({ children }) {
@@ -35,6 +38,9 @@ function AnimatedRoutes() {
       <Routes location={loc} key={loc.pathname}>
         <Route path="/" element={<Landing />} />
         <Route path="/reset-password" element={<ResetPassword />} />
+        <Route path="/privacy" element={<Privacy />} />
+        <Route path="/terms" element={<Terms />} />
+        <Route path="/settings" element={<Private><PageWrap><Settings /></PageWrap></Private>} />
         <Route path="/dashboard" element={<Private><PageWrap><Dashboard /></PageWrap></Private>} />
         <Route path="/feed" element={<Private><PageWrap><Feed /></PageWrap></Private>} />
         <Route path="/guardian" element={<Private><PageWrap><Guardian /></PageWrap></Private>} />

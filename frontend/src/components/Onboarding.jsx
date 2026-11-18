@@ -5,6 +5,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import confetti from "canvas-confetti";
 import { useNavigate } from "react-router-dom";
 import { DISCLAIMER } from "@/constants/helplines";
+import { Link } from "react-router-dom";
 
 const ROLES = [
   { id: "elder", label: "Elder (60+)", desc: "Feeling invisible after the kids moved away", color: "#F2A68A" },
@@ -83,6 +84,7 @@ export default function Onboarding({ onClose }) {
   const [otpLoading, setOtpLoading] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
   const [registeredEmail, setRegisteredEmail] = useState("");
+  const [agreed, setAgreed] = useState(false);
 
   // Resend cooldown timer
   useEffect(() => {
@@ -110,6 +112,7 @@ export default function Onboarding({ onClose }) {
       await register({
         email: data.email, password: data.password,
         name: data.name, role: data.role, locality: data.locality,
+        accept_terms: agreed,
       });
       setRegisteredEmail(data.email);
       setPoints((p) => p + 10);
@@ -152,7 +155,10 @@ export default function Onboarding({ onClose }) {
 
   const finishOnboarding = async () => {
     try {
-      const r = await api.post("/onboarding/complete", { goals: data.goals, guardian_email: data.guardian_email || null });
+      const r = await api.post("/onboarding/complete", {
+        goals: data.goals,
+        guardian_email: data.role === "guardian" ? null : (data.guardian_email.trim() || null),
+      });
       setRevealedScore(r.data.score);
       setPoints(r.data.points);
       await refresh();
@@ -223,6 +229,15 @@ export default function Onboarding({ onClose }) {
                       placeholder="Password (min 6 characters)" type="password" value={data.password} onChange={(e) => setData({ ...data, password: e.target.value })} data-testid="onboarding-password" />
                     <input className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 focus:border-[#C8F04B] outline-none transition"
                       placeholder="Locality (e.g. Indiranagar)" value={data.locality} onChange={(e) => setData({ ...data, locality: e.target.value })} />
+                    <label className="flex items-start gap-3 text-sm text-[#D0D0D0] pt-2" data-testid="onboarding-consent">
+                      <input type="checkbox" className="mt-1" checked={agreed} onChange={(e) => setAgreed(e.target.checked)} />
+                      <span>
+                        I am 18 or older and I agree to the{" "}
+                        <Link to="/privacy" target="_blank" className="underline text-white">privacy policy</Link> and{" "}
+                        <Link to="/terms" target="_blank" className="underline text-white">terms</Link>. I understand my
+                        messages to Mitra are processed by Google Gemini.
+                      </span>
+                    </label>
                   </div>
                   {err && <p className="text-[#F2A68A] mt-3 label-mono">{err}</p>}
                 </>
@@ -276,11 +291,29 @@ export default function Onboarding({ onClose }) {
               {/* Step 4 — Guardian */}
               {step === 4 && (
                 <>
-                  <h2 className="font-display text-5xl mb-2">{data.role === "guardian" ? "LINK YOUR ELDER" : "GUARDIAN LINK"}</h2>
-                  <p className="label-mono text-[#A0A0A0] mb-8">Optional — they'll get gentle alerts only when needed</p>
-                  <input className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 focus:border-[#F2A68A] outline-none transition"
-                    placeholder="guardian@email.com" value={data.guardian_email} onChange={(e) => setData({ ...data, guardian_email: e.target.value })} />
-                  <p className="text-sm text-[#A0A0A0] mt-4">You can skip — add this later in settings.</p>
+                  {data.role === "guardian" ? (
+                    <>
+                      <h2 className="font-display text-5xl mb-2">LINKING WITH FAMILY</h2>
+                      <p className="text-[#D0D0D0] mt-4">
+                        To look after someone, ask them to invite you from <strong>Settings</strong> in their Solace app,
+                        using this email address. You'll see the invitation in your Settings to accept.
+                      </p>
+                      <p className="text-sm text-[#A0A0A0] mt-4">
+                        You'll see a wellbeing summary only. Their journal and chats always stay private.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <h2 className="font-display text-5xl mb-2">INVITE A GUARDIAN</h2>
+                      <p className="label-mono text-[#A0A0A0] mb-6">Optional · a family member or friend who looks out for you</p>
+                      <input className="w-full bg-transparent border border-[#333] rounded-sm px-4 py-3 focus:border-[#F2A68A] outline-none transition"
+                        placeholder="guardian@email.com" value={data.guardian_email} onChange={(e) => setData({ ...data, guardian_email: e.target.value })} />
+                      <p className="text-sm text-[#A0A0A0] mt-4">
+                        They'll get an email and must accept first. They'll see a short wellbeing summary only,
+                        never your journal or chats with Mitra. You can stop sharing any time in Settings, or skip this now.
+                      </p>
+                    </>
+                  )}
                 </>
               )}
 
@@ -311,7 +344,7 @@ export default function Onboarding({ onClose }) {
             ← Back
           </button>
           {step === 1 ? (
-            <button onClick={submitAccount} disabled={!data.email || !data.password || !data.name}
+            <button onClick={submitAccount} disabled={!data.email || !data.password || !data.name || !agreed}
               className="bg-[#C8F04B] text-black px-6 py-2 label-mono disabled:opacity-30 hover:bg-white transition">
               Send Code →
             </button>

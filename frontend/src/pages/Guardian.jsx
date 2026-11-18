@@ -9,20 +9,19 @@ export default function Guardian() {
   const [tab, setTab] = useState("monitor");
   const [selected, setSelected] = useState(null);
   const [report, setReport] = useState(null);
-  const [adding, setAdding] = useState({ name: "", relation: "", age: "" });
+  const [invites, setInvites] = useState([]);
 
-  useEffect(() => { api.get("/guardian/members").then(r => { setMembers(r.data); setSelected(r.data[0]); }); }, []);
+  const load = () => {
+    api.get("/guardian/members").then(r => { setMembers(r.data); setSelected(r.data[0] || null); }).catch(() => {});
+    api.get("/guardian/invites").then(r => setInvites(r.data)).catch(() => {});
+  };
+  useEffect(load, []);
   useEffect(() => {
     if (selected && tab === "report") api.get(`/guardian/report/${selected.id}`).then(r => setReport(r.data));
   }, [selected, tab]);
 
-  const addMember = async () => {
-    if (!adding.name) return;
-    const r = await api.post("/guardian/add", { ...adding, age: parseInt(adding.age) || 30 });
-    setMembers([...members, { ...r.data, insight: "Newly added. Score will populate over the next 48 hours.", last_seen: "just now", weekly: [70,70,70,70,72,72,72], avatar: "https://images.unsplash.com/photo-1599566150163-29194dcaad36?w=300&q=70" }]);
-    setAdding({ name: "", relation: "", age: "" });
-    setTab("monitor");
-  };
+  const accept = async (id) => { await api.post(`/guardian/accept/${id}`); load(); setTab("monitor"); };
+  const decline = async (id) => { await api.post(`/guardian/revoke/${id}`); load(); };
 
   const sparkline = (data) => {
     if (!data) return null;
@@ -37,13 +36,28 @@ export default function Guardian() {
       <h1 className="font-display text-6xl md:text-7xl mb-6 mt-2">EYES THAT CARE.</h1>
 
       <div className="flex gap-2 mb-8" data-testid="guardian-tabs">
-        {["monitor", "report", "add"].map(t => (
+        {["monitor", "report", "invites"].map(t => (
           <button key={t} onClick={() => setTab(t)} data-testid={`tab-${t}`}
             className={`px-5 py-2 label-mono transition ${tab === t ? "bg-[#F2A68A] text-black" : "border border-[#222] text-[#A0A0A0] hover:border-white/30"}`}>
-            {t.toUpperCase()}
+            {t.toUpperCase()}{t === "invites" && invites.length > 0 ? ` (${invites.length})` : ""}
           </button>
         ))}
       </div>
+
+      <p className="text-sm text-[#A0A0A0] mb-6 max-w-2xl">
+        You see a wellbeing summary for people who invited you. Their journals, chats with Mitra and post text always stay private,
+        and they can stop sharing at any time.
+      </p>
+
+      {tab === "monitor" && members.length === 0 && (
+        <div className="p-8 border border-[#1A1A1A] rounded-sm max-w-xl" data-testid="guardian-empty">
+          <p className="font-display text-3xl">No one has linked you yet.</p>
+          <p className="text-[#A0A0A0] mt-2">
+            Ask your family member to invite you from Settings in their Solace app, using your email address.
+            {invites.length > 0 && " You have an invitation waiting in the Invites tab."}
+          </p>
+        </div>
+      )}
 
       {tab === "monitor" && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -56,7 +70,7 @@ export default function Guardian() {
                 <img src={m.avatar} alt={m.name} className="w-16 h-16 rounded-full object-cover" />
                 <div className="flex-1">
                   <p className="font-display text-2xl">{m.name}</p>
-                  <p className="label-mono text-[#A0A0A0]">{m.relation} · age {m.age} · {m.last_seen}</p>
+                  <p className="label-mono text-[#A0A0A0]">{m.relation}{m.age ? ` · age ${m.age}` : ""} · {m.last_seen}</p>
                 </div>
                 <div className="text-right">
                   <p className="font-mono text-4xl tabular-nums" style={{ color: BAND[m.band] }}>{m.score}</p>
@@ -81,7 +95,7 @@ export default function Guardian() {
           <div className="md:col-span-1 p-6 border border-[#F2A68A]/30 rounded-sm">
             <img src={report.member.avatar} className="w-full aspect-square object-cover rounded-sm mb-4" alt=""/>
             <p className="font-display text-3xl">{report.member.name}</p>
-            <p className="label-mono text-[#A0A0A0]">{report.member.relation} · age {report.member.age}</p>
+            <p className="label-mono text-[#A0A0A0]">{report.member.relation}{report.member.age ? ` · age ${report.member.age}` : ""}</p>
             <div className="mt-4">
               <p className="label-mono text-[#A0A0A0] mb-2">/ select member</p>
               <select value={report.member.id} onChange={(e) => setSelected(members.find(m => m.id === e.target.value))}
@@ -93,8 +107,8 @@ export default function Guardian() {
           <div className="md:col-span-2 p-6 border border-[#1A1A1A] rounded-sm">
             <p className="label-mono text-[#F2A68A] mb-3">/ weekly score trend</p>
             <svg viewBox="0 0 240 80" className="w-full h-32">
-              <polyline points={report.weekly_score.map((v, i) => `${i*40},${80 - v*0.7}`).join(" ")} fill="none" stroke="#F2A68A" strokeWidth="3"/>
-              {report.weekly_score.map((v, i) => <circle key={i} cx={i*40} cy={80-v*0.7} r="4" fill="#F2A68A"/>)}
+              <polyline points={(report.weekly_score || []).map((v, i) => `${i*40},${80 - v*0.7}`).join(" ")} fill="none" stroke="#F2A68A" strokeWidth="3"/>
+              {(report.weekly_score || []).map((v, i) => <circle key={i} cx={i*40} cy={80-v*0.7} r="4" fill="#F2A68A"/>)}
             </svg>
             <div className="grid grid-cols-7 mt-1 text-center">
               {["M","T","W","T","F","S","S"].map((d, i) => <span key={i} className="label-mono text-[#666]">{d}</span>)}
@@ -119,17 +133,18 @@ export default function Guardian() {
         </div>
       )}
 
-      {tab === "add" && (
-        <div className="max-w-lg">
-          <p className="label-mono text-[#A0A0A0] mb-4">/ add a person to monitor</p>
-          <input className="w-full bg-transparent border border-[#222] rounded-sm px-4 py-3 mb-3 outline-none focus:border-[#F2A68A]"
-            placeholder="Full name" value={adding.name} onChange={(e) => setAdding({...adding, name: e.target.value})} />
-          <input className="w-full bg-transparent border border-[#222] rounded-sm px-4 py-3 mb-3 outline-none focus:border-[#F2A68A]"
-            placeholder="Relation (e.g. Mother)" value={adding.relation} onChange={(e) => setAdding({...adding, relation: e.target.value})} />
-          <input className="w-full bg-transparent border border-[#222] rounded-sm px-4 py-3 mb-4 outline-none focus:border-[#F2A68A]"
-            placeholder="Age" type="number" value={adding.age} onChange={(e) => setAdding({...adding, age: e.target.value})} />
-          <button onClick={addMember} data-testid="guardian-add-submit"
-            className="w-full bg-[#F2A68A] text-black py-3 label-mono">ADD MEMBER →</button>
+      {tab === "invites" && (
+        <div className="max-w-lg space-y-3" data-testid="guardian-invites">
+          {invites.length === 0 && <p className="text-[#A0A0A0]">No invitations right now.</p>}
+          {invites.map((i) => (
+            <div key={i.id} className="p-4 border border-[#222] rounded-sm flex items-center justify-between gap-3">
+              <p>{i.member_name || "Someone"} invited you to be their guardian</p>
+              <div className="flex gap-2">
+                <button onClick={() => accept(i.id)} className="bg-[#F2A68A] text-black px-3 py-1.5 label-mono">Accept</button>
+                <button onClick={() => decline(i.id)} className="border border-[#333] px-3 py-1.5 label-mono text-[#A0A0A0]">Decline</button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>
